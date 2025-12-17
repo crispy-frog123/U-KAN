@@ -25,6 +25,7 @@ import archs
 
 import losses
 from dataset import Dataset
+from dataset_e import ComplexMatDataset,TransformSubset
 
 from metrics import iou_score, indicators
 
@@ -37,6 +38,7 @@ import os
 import subprocess
 
 from pdb import set_trace as st
+import albumentations as A
 
 
 ARCH_NAMES = archs.__all__
@@ -53,85 +55,95 @@ def list_type(s):
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--name', default=None,
+    # ========== 模型相关 ==========
+    parser.add_argument('--name', default='KANUNet_experiment',
                         help='model name: (default: arch+timestamp)')
-    parser.add_argument('--epochs', default=400, type=int, metavar='N',
-                        help='number of total epochs to run')
-    parser.add_argument('-b', '--batch_size', default=8, type=int,
-                        metavar='N', help='mini-batch size (default: 16)')
+    parser.add_argument('--arch', '-a', metavar='ARCH', default='KANUNet')
 
-    parser.add_argument('--dataseed', default=2981, type=int,
-                        help='')
-    
-    # model
-    parser.add_argument('--arch', '-a', metavar='ARCH', default='UKAN')
-    
-    parser.add_argument('--deep_supervision', default=False, type=str2bool)
-    parser.add_argument('--input_channels', default=3, type=int,
-                        help='input channels')
-    parser.add_argument('--num_classes', default=1, type=int,
-                        help='number of classes')
+    # ========== 数据集相关 ==========
+    parser.add_argument('--dataset', default='complex_chi',
+                        help='dataset name: complex_chi for complex magnetic susceptibility data')
+    parser.add_argument('--data_dir', default='inputs',
+                        help='directory containing the .mat files')
+
+    # 复数数据的4个文件
+    parser.add_argument('--real_img_file', default='/data/input/chi_all_real_64.mat',
+                        help='real part image file')
+    parser.add_argument('--imag_img_file', default='/data/input/chi_all_imag_64.mov',
+                        help='imaginary part image file')
+    parser.add_argument('--real_mask_file', default='/data/lable/chi0_all_real_64.mat',
+                        help='real part mask file')
+    parser.add_argument('--imag_mask_file', default='/data/lable/chi0_all_imag_64.mat',
+                        help='imaginary part mask file')
+
+    # .mat文件变量名
+    parser.add_argument('--img_var_name', default='chi_all_real',
+                        help='variable name for images in .mat file')
+    parser.add_argument('--mask_var_name', default='chi_all_real_mask',
+                        help='variable name for masks in .mat file')
+
+    # 原始图片尺寸
+    parser.add_argument('--original_img_size', default=64, type=int,
+                        help='original image size in .mat file (e.g., 64 for 64x64)')
+
+    parser.add_argument('--output_dir', default='outputs',
+                        help='output directory for results')
+
+    # ========== 输入尺寸 ==========
+    parser.add_argument('--input_channels', default=2, type=int,
+                        help='input channels (2 for real+imaginary)')
+    parser.add_argument('--num_classes', default=2, type=int,
+                        help='number of classes (2 for real+imaginary masks)')
     parser.add_argument('--input_w', default=256, type=int,
-                        help='image width')
+                        help='image width for training')
     parser.add_argument('--input_h', default=256, type=int,
-                        help='image height')
-    parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
+                        help='image height for training')
 
-    # loss
-    parser.add_argument('--loss', default='BCEDiceLoss',
-                        choices=LOSS_NAMES,
-                        help='loss: ' +
-                        ' | '.join(LOSS_NAMES) +
-                        ' (default: BCEDiceLoss)')
-    
-    # dataset
-    parser.add_argument('--dataset', default='busi', help='dataset name')      
-    parser.add_argument('--data_dir', default='inputs', help='dataset dir')
+    # ========== 训练超参数 ==========
+    parser.add_argument('--epochs', default=100, type=int, metavar='N',
+                        help='number of total epochs to run')
+    parser.add_argument('-b', '--batch_size', default=4, type=int,
+                        metavar='N', help='mini-batch size (default: 4)')
 
-    parser.add_argument('--output_dir', default='outputs', help='ouput dir')
+    # 学习率
+    parser.add_argument('--lr', '--learning-rate', default=1e-4, type=float,
+                        metavar='LR', help='initial learning rate')
+    parser.add_argument('--kan_lr', default=1e-3, type=float,
+                        help='learning rate for KAN layers')
 
-
-    # optimizer
+    # 优化器
     parser.add_argument('--optimizer', default='Adam',
-                        choices=['Adam', 'SGD'],
-                        help='loss: ' +
-                        ' | '.join(['Adam', 'SGD']) +
-                        ' (default: Adam)')
-
-    parser.add_argument('--lr', '--learning_rate', default=1e-4, type=float,
-                        metavar='LR', help='initial learning rate')
+                        choices=['Adam', 'SGD', 'AdamW'],
+                        help='optimizer')
     parser.add_argument('--momentum', default=0.9, type=float,
-                        help='momentum')
-    parser.add_argument('--weight_decay', default=1e-4, type=float,
-                        help='weight decay')
-    parser.add_argument('--nesterov', default=False, type=str2bool,
-                        help='nesterov')
-
-    parser.add_argument('--kan_lr', default=1e-2, type=float,
-                        metavar='LR', help='initial learning rate')
-    parser.add_argument('--kan_weight_decay', default=1e-4, type=float,
+                        help='momentum for SGD')
+    parser.add_argument('--weight-decay', default=1e-4, type=float,
                         help='weight decay')
 
-    # scheduler
+    # 学习率调度
     parser.add_argument('--scheduler', default='CosineAnnealingLR',
-                        choices=['CosineAnnealingLR', 'ReduceLROnPlateau', 'MultiStepLR', 'ConstantLR'])
-    parser.add_argument('--min_lr', default=1e-5, type=float,
-                        help='minimum learning rate')
-    parser.add_argument('--factor', default=0.1, type=float)
-    parser.add_argument('--patience', default=2, type=int)
-    parser.add_argument('--milestones', default='1,2', type=str)
-    parser.add_argument('--gamma', default=2/3, type=float)
-    parser.add_argument('--early_stopping', default=-1, type=int,
-                        metavar='N', help='early stopping (default: -1)')
-    parser.add_argument('--cfg', type=str, metavar="FILE", help='path to config file', )
-    parser.add_argument('--num_workers', default=4, type=int)
+                        choices=['CosineAnnealingLR', 'ReduceLROnPlateau',
+                                 'MultiStepLR', 'ConstantLR'])
 
-    parser.add_argument('--no_kan', action='store_true')
+    # ========== 损失函数 ==========
+    parser.add_argument('--loss', default='BCEDiceLoss',
+                        choices=['BCEWithLogitsLoss', 'BCEDiceLoss'])
 
+    # ========== 早停 ==========
+    parser.add_argument('--early_stopping', default=20, type=int,
+                        metavar='N', help='early stopping (default: 20)')
 
+    # ========== 数据划分 ==========
+    parser.add_argument('--dataseed', default=42, type=int,
+                        help='random seed for data split')
+    parser.add_argument('--val_split', default=0.2, type=float,
+                        help='validation split ratio (default: 0.2 = 20%)')
+
+    # ========== 其他 ==========
+    parser.add_argument('--num_workers', default=0, type=int,
+                        help='number of workers for data loading')
 
     config = parser.parse_args()
-
     return config
 
 
@@ -258,10 +270,11 @@ def main():
     os.makedirs(f'{output_dir}/{exp_name}', exist_ok=True)  # 创建实验输出目录，如果已存在则不报错
 
     # 打印所有配置参数
-    print('-' * 20)
+    print('-' * 60)
+    print('Configuration:')
     for key in config:
-        print('%s: %s' % (key, config[key]))  # 逐行打印配置项
-    print('-' * 20)
+        print(f'  {key}: {config[key]}')
+    print('-' * 60)
 
     # 将配置保存为YAML文件
     with open(f'{output_dir}/{exp_name}/config.yml', 'w') as f:
@@ -329,72 +342,105 @@ def main():
     shutil.copy2('train.py', f'{output_dir}/{exp_name}/')  # 复制训练脚本
     shutil.copy2('archs.py', f'{output_dir}/{exp_name}/')  # 复制模型架构文件
 
-    dataset_name = config['dataset']  # 获取数据集名称
-    img_ext = '.png'  # 图像文件扩展名
+    # ========== 数据加载 ==========
+    print('\n' + '=' * 60)
+    print('Loading Dataset')
+    print('=' * 60)
 
-    # 根据数据集设置mask文件扩展名
-    if dataset_name == 'busi':
-        mask_ext = '_mask.png'  # BUSI数据集的mask文件后缀
-    elif dataset_name == 'glas':
-        mask_ext = '.png'  # GlaS数据集的mask文件后缀
-    elif dataset_name == 'cvc':
-        mask_ext = '.png'  # CVC数据集的mask文件后缀
-
-    # 数据加载代码
-    img_ids = sorted(
-        glob(os.path.join(config['data_dir'], config['dataset'], 'images', '*' + img_ext)))  # 获取所有图像文件路径并排序
-    img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]  # 提取文件名（不含路径和扩展名）作为图像ID
-
-    train_img_ids, val_img_ids = train_test_split(img_ids, test_size=0.2,
-                                                  random_state=config['dataseed'])  # 划分训练集和验证集（80%训练，20%验证），使用固定种子
-
-    # 定义训练集数据增强
-    train_transform = Compose([
-        RandomRotate90(),  # 随机90度旋转
-        geometric.transforms.Flip(),  # 随机翻转
-        Resize(config['input_h'], config['input_w']),  # 缩放到指定尺寸
-        transforms.Normalize(),  # 归一化
+    # 定义数据增强
+    train_transform = A.Compose([
+        A.Resize(config['input_h'], config['input_w']),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.ElasticTransform(alpha=1, sigma=50, p=0.3),
+        A.GridDistortion(p=0.3),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
     ])
 
-    # 定义验证集数据变换（不增强）
-    val_transform = Compose([
-        Resize(config['input_h'], config['input_w']),  # 缩放到指定尺寸
-        transforms.Normalize(),  # 归一化
+    val_transform = A.Compose([
+        A.Resize(config['input_h'], config['input_w']),
     ])
 
-    # 创建训练数据集
-    train_dataset = Dataset(
-        img_ids=train_img_ids,  # 训练图像ID列表
-        img_dir=os.path.join(config['data_dir'], config['dataset'], 'images'),  # 图像目录路径
-        mask_dir=os.path.join(config['data_dir'], config['dataset'], 'masks'),  # mask目录路径
-        img_ext=img_ext,  # 图像文件扩展名
-        mask_ext=mask_ext,  # mask文件扩展名
-        num_classes=config['num_classes'],  # 类别数
-        transform=train_transform)  # 数据增强变换
-    # 创建验证数据集
-    val_dataset = Dataset(
-        img_ids=val_img_ids,  # 验证图像ID列表
-        img_dir=os.path.join(config['data_dir'], config['dataset'], 'images'),  # 图像目录路径
-        mask_dir=os.path.join(config['data_dir'], config['dataset'], 'masks'),  # mask目录路径
-        img_ext=img_ext,  # 图像文件扩展名
-        mask_ext=mask_ext,  # mask文件扩展名
-        num_classes=config['num_classes'],  # 类别数
-        transform=val_transform)  # 数据变换
+    # 构建完整的文件路径
+    real_img_path = os.path.join(config['data_dir'], config['real_img_file'])
+    imag_img_path = os.path.join(config['data_dir'], config['imag_img_file'])
+    real_mask_path = os.path.join(config['data_dir'], config['real_mask_file'])
+    imag_mask_path = os.path.join(config['data_dir'], config['imag_mask_file'])
 
-    # 创建训练数据加载器
+    # 检查文件是否存在
+    print('\nChecking files...')
+    for path in [real_img_path, imag_img_path, real_mask_path, imag_mask_path]:
+        if os.path.exists(path):
+            print(f'  ✓ {path}')
+        else:
+            print(f'  ✗ {path} NOT FOUND!')
+            raise FileNotFoundError(f"File not found: {path}")
+
+    # 创建完整数据集
+    full_dataset = ComplexMatDataset(
+        real_img_path=real_img_path,
+        imag_img_path=imag_img_path,
+        real_mask_path=real_mask_path,
+        imag_mask_path=imag_mask_path,
+        img_var_name=config['img_var_name'],
+        mask_var_name=config['mask_var_name'],
+        img_size=(config['original_img_size'], config['original_img_size']),
+    )
+
+    # 划分训练/验证集
+    total_samples = len(full_dataset)
+    indices = np.arange(total_samples)
+
+    train_indices, val_indices = train_test_split(
+        indices,
+        test_size=config['val_split'],
+        random_state=config['dataseed']
+    )
+
+    print('\n' + '-' * 60)
+    print('Dataset Split:')
+    print(f'  Total samples: {total_samples}')
+    print(f'  Training samples: {len(train_indices)} ({len(train_indices) / total_samples * 100:.1f}%)')
+    print(f'  Validation samples: {len(val_indices)} ({len(val_indices) / total_samples * 100:.1f}%)')
+    print(f'  Train indices: {train_indices}')
+    print(f'  Val indices: {val_indices}')
+    print('-' * 60)
+
+    # 创建子集
+    train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
+    val_dataset = TransformSubset(full_dataset, val_indices, val_transform)
+
+    # 创建DataLoader
     train_loader = torch.utils.data.DataLoader(
-        train_dataset,  # 训练数据集
-        batch_size=config['batch_size'],  # 批次大小
-        shuffle=True,  # 每个epoch打乱数据
-        num_workers=config['num_workers'],  # 数据加载的子进程数
-        drop_last=True)  # 丢弃最后不完整的batch
-    # 创建验证数据加载器
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=config['num_workers'],
+        drop_last=False,
+        pin_memory=True
+    )
+
     val_loader = torch.utils.data.DataLoader(
-        val_dataset,  # 验证数据集
-        batch_size=config['batch_size'],  # 批次大小
-        shuffle=False,  # 不打乱数据
-        num_workers=config['num_workers'],  # 数据加载的子进程数
-        drop_last=False)  # 不丢弃数据
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        drop_last=False,
+        pin_memory=True
+    )
+
+    print(f'\nDataLoader created:')
+    print(f'  Train batches: {len(train_loader)}')
+    print(f'  Val batches: {len(val_loader)}')
+
+    # 测试一个batch
+    print(f'\nTesting DataLoader...')
+    for img_batch, mask_batch, meta_batch in train_loader:
+        print(f'  Image batch shape: {img_batch.shape}')  # (batch, 2, H, W)
+        print(f'  Mask batch shape: {mask_batch.shape}')  # (batch, 2, H, W)
+        print(f'  Value range: [{img_batch.min():.4f}, {img_batch.max():.4f}]')
+        break
 
     # 创建训练日志字典
     log = OrderedDict([
