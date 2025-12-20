@@ -18,10 +18,11 @@ class ComplexMatDataset(Dataset):
         imag_img_path (str): 虚部图片的.mat文件路径
         real_mask_path (str): 实部掩码的.mat文件路径
         imag_mask_path (str): 虚部掩码的.mat文件路径
-        img_var_name (str): 图片变量名
-        mask_var_name (str): 掩码变量名
+        img_var_name (str): 图片变量名（None=自动推断）
+        mask_var_name (str): 掩码变量名（None=自动推断）
         img_size (tuple): 图片尺寸 (H, W)，默认(64, 64)
         transform (callable, optional): 数据增强
+        normalize_method (str): 归一化方法 ['z-score', 'min-max', 'none']
     """
 
     def __init__(self,
@@ -29,36 +30,45 @@ class ComplexMatDataset(Dataset):
                  imag_img_path,
                  real_mask_path,
                  imag_mask_path,
-                 img_var_name='chi_all_real',
-                 mask_var_name='chi_all_real_mask',
+                 img_var_name=None,
+                 mask_var_name=None,
                  img_size=(64, 64),
-                 transform=None):
+                 transform=None,
+                 normalize_method='z-score'):  # ← 新增参数
 
         self.transform = transform
         self.img_size = img_size
         self.H, self.W = img_size
+        self.normalize_method = normalize_method  # ← 保存归一化方法
+
+        # ========== 变量名处理 ==========
+        if img_var_name in [None, 'None', '']:
+            img_var_name = None
+        if mask_var_name in [None, 'None', '']:
+            mask_var_name = None
+
+        real_img_var = img_var_name
+        imag_img_var = img_var_name
+        real_mask_var = mask_var_name
+        imag_mask_var = mask_var_name
+        # ===============================
 
         print("=" * 60)
         print("Loading Complex Data (Real + Imaginary)")
         print("=" * 60)
 
-        # 读取实部数据
-        print("\n[1/4] Loading Real part images...")
-        real_img_data = self._load_mat(real_img_path, img_var_name)
-        print(f"  Shape: {real_img_data.shape}, dtype: {real_img_data.dtype}")
+        # 加载数据
+        print("[1/4] Loading Real part images...")
+        real_img_data = self._load_mat(real_img_path, real_img_var)
 
-        print("[2/4] Loading Real part masks...")
-        real_mask_data = self._load_mat(real_mask_path, mask_var_name)
-        print(f"  Shape: {real_mask_data.shape}, dtype: {real_mask_data.dtype}")
+        print("[2/4] Loading Imaginary part images...")
+        imag_img_data = self._load_mat(imag_img_path, imag_img_var)
 
-        # 读取虚部数据
-        print("[3/4] Loading Imaginary part images...")
-        imag_img_data = self._load_mat(imag_img_path, img_var_name)
-        print(f"  Shape: {imag_img_data.shape}, dtype: {imag_img_data.dtype}")
+        print("[3/4] Loading Real part masks...")
+        real_mask_data = self._load_mat(real_mask_path, real_mask_var)
 
         print("[4/4] Loading Imaginary part masks...")
-        imag_mask_data = self._load_mat(imag_mask_path, mask_var_name)
-        print(f"  Shape: {imag_mask_data.shape}, dtype: {imag_mask_data.dtype}")
+        imag_mask_data = self._load_mat(imag_mask_path, imag_mask_var)
 
         # Reshape数据
         print("\nReshaping data...")
@@ -81,6 +91,10 @@ class ComplexMatDataset(Dataset):
         assert self.images.shape[0] == self.masks.shape[0], \
             f"Images and masks count mismatch!"
 
+        # ========== 计算归一化参数 ==========
+        self._compute_normalize_params()
+        # ==================================
+
         # 统计信息
         print("\n" + "=" * 60)
         print("Dataset loaded successfully!")
@@ -90,16 +104,33 @@ class ComplexMatDataset(Dataset):
         print(f"  Channels: 2 (Real + Imaginary)")
         print(f"  Value range: [{self.images.min():.4f}, {self.images.max():.4f}]")
         print(f"  Mean: {self.images.mean():.4f}, Std: {self.images.std():.4f}")
+        print(f"  Normalize method: {self.normalize_method}")  # ← 新增
         print("=" * 60 + "\n")
 
     def _load_mat(self, mat_path, var_name):
-        """加载.mat文件"""
+        """加载.mat文件，支持自动推断变量名"""
         try:
             import scipy.io as sio
             data = sio.loadmat(mat_path)
+
+            # 自动推断变量名
+            if var_name is None:
+                available_vars = [k for k in data.keys() if not k.startswith('__')]
+                if not available_vars:
+                    raise ValueError(f"No valid variables in {mat_path}")
+                var_name = available_vars[0]
+                print(f"    Auto-selected variable: '{var_name}'")
+
             return data[var_name]
         except:
             with h5py.File(mat_path, 'r') as f:
+                if var_name is None:
+                    available_vars = list(f.keys())
+                    if not available_vars:
+                        raise ValueError(f"No valid variables in {mat_path}")
+                    var_name = available_vars[0]
+                    print(f"    Auto-selected variable: '{var_name}'")
+
                 data = f[var_name][:]
                 if data.shape[0] != self.H * self.W:
                     data = data.T
@@ -131,6 +162,64 @@ class ComplexMatDataset(Dataset):
 
         return data.astype('float32')
 
+    # ========== 新增：计算归一化参数 ==========
+    def _compute_normalize_params(self):
+        """计算归一化参数（针对每个通道）"""
+        if self.normalize_method == 'z-score':
+            # 分通道计算
+            self.real_mean = self.images[:, :, :, 0].mean()
+            self.real_std = self.images[:, :, :, 0].std()
+            self.imag_mean = self.images[:, :, :, 1].mean()
+            self.imag_std = self.images[:, :, :, 1].std()
+
+            print(f"\nZ-Score Normalization Parameters:")
+            print(f"  Real channel - mean: {self.real_mean:.4f}, std: {self.real_std:.4f}")
+            print(f"  Imag channel - mean: {self.imag_mean:.4f}, std: {self.imag_std:.4f}")
+
+        elif self.normalize_method == 'min-max':
+            self.real_min = self.images[:, :, :, 0].min()
+            self.real_max = self.images[:, :, :, 0].max()
+            self.imag_min = self.images[:, :, :, 1].min()
+            self.imag_max = self.images[:, :, :, 1].max()
+
+            print(f"\nMin-Max Normalization Parameters:")
+            print(f"  Real channel - min: {self.real_min:.4f}, max: {self.real_max:.4f}")
+            print(f"  Imag channel - min: {self.imag_min:.4f}, max: {self.imag_max:.4f}")
+
+        elif self.normalize_method == 'none':
+            print(f"\nNo normalization applied")
+
+        else:
+            raise ValueError(f"Unknown normalize_method: {self.normalize_method}")
+
+    def _normalize(self, img):
+        """
+        对图像进行归一化
+
+        Args:
+            img: (H, W, 2) - 2通道图像
+
+        Returns:
+            normalized_img: (H, W, 2)
+        """
+        if self.normalize_method == 'z-score':
+            # 实部归一化
+            img[:, :, 0] = (img[:, :, 0] - self.real_mean) / (self.real_std + 1e-8)
+            # 虚部归一化
+            img[:, :, 1] = (img[:, :, 1] - self.imag_mean) / (self.imag_std + 1e-8)
+
+        elif self.normalize_method == 'min-max':
+            # 实部归一化到[0, 1]
+            img[:, :, 0] = (img[:, :, 0] - self.real_min) / (self.real_max - self.real_min + 1e-8)
+            # 虚部归一化到[0, 1]
+            img[:, :, 1] = (img[:, :, 1] - self.imag_min) / (self.imag_max - self.imag_min + 1e-8)
+
+        # 'none': 不做处理
+
+        return img
+
+    # ========================================
+
     def __len__(self):
         return self.images.shape[0]
 
@@ -140,19 +229,12 @@ class ComplexMatDataset(Dataset):
         img = self.images[idx].copy()  # (64, 64, 2)
         mask = self.masks[idx].copy()  # (64, 64, 2)
 
-        # 归一化到[0, 1]
-        img_min = self.images.min()
-        img_max = self.images.max()
+        # ========== 应用归一化 ==========
+        img = self._normalize(img)
+        mask = self._normalize(mask)
+        # ===============================
 
-        if img_max > img_min:
-            img = (img - img_min) / (img_max - img_min)
 
-        # 掩码归一化
-        if mask.max() > 1.0:
-            mask = mask / mask.max()
-
-        # 二值化掩码
-        mask = (mask > 0.5).astype('float32')
 
         # 数据增强
         if self.transform is not None:

@@ -13,7 +13,27 @@ import matplotlib.pyplot as plt
 from utils import *
 
 import timm
-from timm.layers import DropPath, to_2tuple, trunc_normal_
+
+try:
+    from timm.layers import DropPath, to_2tuple, trunc_normal_
+except ImportError:
+    try:
+        from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+    except ImportError:
+        # 如果都失败，使用torch的替代品
+        from torch.nn import Identity as DropPath
+
+
+        def to_2tuple(x):
+            if isinstance(x, (list, tuple)):
+                return x
+            return (x, x)
+
+
+        def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
+            import torch
+            torch.nn.init.trunc_normal_(tensor, mean, std, a, b)
+            return tensor
 import types
 import math
 from abc import ABCMeta, abstractmethod
@@ -327,15 +347,17 @@ class D_ConvLayer(nn.Module):
 class UKAN(nn.Module):
     """U-KAN：基于KAN的U-Net架构用于图像分割"""
 
-    def __init__(self, num_classes, input_channels=3, deep_supervision=False, img_size=224, patch_size=16, in_chans=3,
+    def __init__(self, num_classes, input_channels, deep_supervision=False,
+                 img_size=224, patch_size=16,
                  embed_dims=[256, 320, 512], no_kan=False,
-                 drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm, depths=[1, 1, 1], **kwargs):
+                 drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
+                 depths=[1, 1, 1], **kwargs):
         super().__init__()
 
         kan_input_dim = embed_dims[0]  # KAN层的输入维度
 
         # 编码器：三个卷积层，逐步下采样
-        self.encoder1 = ConvLayer(3, kan_input_dim // 8)  # 编码器第1层：3 -> kan_input_dim//8
+        self.encoder1 = ConvLayer(input_channels, kan_input_dim // 8)  # 编码器第1层：3 -> kan_input_dim//8
         self.encoder2 = ConvLayer(kan_input_dim // 8, kan_input_dim // 4)  # 编码器第2层：kan_input_dim//8 -> kan_input_dim//4
         self.encoder3 = ConvLayer(kan_input_dim // 4, kan_input_dim)  # 编码器第3层：kan_input_dim//4 -> kan_input_dim
 
