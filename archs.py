@@ -42,7 +42,58 @@ from pdb import set_trace as st  # 调试工具
 
 from kan import KANLinear, KAN  # 导入KAN（Kolmogorov-Arnold Network）相关模块
 from torch.nn import init
+from FCS_attention import MultiSpectralAttentionLayer #导入FCSA模块
 __all__ = ['UKAN']  # 导出UKAN模型
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class FcsAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, img_size, reduction=16):
+        super(FcsAttention, self).__init__()
+        c2wh = dict([(out_channels // 4, img_size // 4), (out_channels // 2, img_size // 8), (out_channels, img_size // 16)])
+        # 确保 out_channels 在 c2wh 字典中是有效的键
+        if out_channels not in c2wh:
+            raise ValueError(f"out_channels value {out_channels} is not supported.")
+
+        self.spatial = SpatialAttention()
+        self.frequency_channel = MultiSpectralAttentionLayer(
+            channel=out_channels,
+            dct_h=c2wh[out_channels],
+            dct_w=c2wh[out_channels],
+            reduction=reduction,
+            freq_sel_method='top16'
+        )
+
+    def forward(self, x):
+        x = self.frequency_channel(x)
+        x = self.spatial(x) * x
+        return x
+
+class ChannelLinear(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ChannelLinear, self).__init__()
+        self.linear = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x = x.permute(0, 2, 3, 1).contiguous()
+        x = x.view(-1, c)
+        x = self.linear(x)
+        x = x.view(b, h, w, -1)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x
 
 
 class KANLayer(nn.Module):
@@ -351,127 +402,273 @@ class UKAN(nn.Module):
                  img_size=224, patch_size=16,
                  embed_dims=[256, 320, 512], no_kan=False,
                  drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
-                 depths=[1, 1, 1], **kwargs):
+                 depths=[1, 1, 1, 1, 1, 1], **kwargs):
         super().__init__()
 
         kan_input_dim = embed_dims[0]  # KAN层的输入维度
 
-        # 编码器：三个卷积层，逐步下采样
-        self.encoder1 = ConvLayer(input_channels, kan_input_dim // 8)  # 编码器第1层：3 -> kan_input_dim//8
-        self.encoder2 = ConvLayer(kan_input_dim // 8, kan_input_dim // 4)  # 编码器第2层：kan_input_dim//8 -> kan_input_dim//4
-        self.encoder3 = ConvLayer(kan_input_dim // 4, kan_input_dim)  # 编码器第3层：kan_input_dim//4 -> kan_input_dim
+        # 初始的卷积编码器层 (Stage 0)
+        self.encoder1 = ConvLayer(3, kan_input_dim // 8)
+        self.encoder2 = ConvLayer(kan_input_dim // 8, kan_input_dim // 4)
+        self.encoder3 = ConvLayer(kan_input_dim // 4, kan_input_dim)
+        self.encoder4 = ConvLayer(embed_dims[0], embed_dims[1])
 
-        self.norm3 = norm_layer(embed_dims[1])  # 编码器阶段3的LayerNorm
-        self.norm4 = norm_layer(embed_dims[2])  # 编码器阶段4的LayerNorm（瓶颈层）
+        # 归一化层
+        self.norm0 = norm_layer(embed_dims[0] // 8)
+        self.norm1 = norm_layer(embed_dims[0] // 4)
+        self.norm2 = norm_layer(embed_dims[0])
+        self.norm3 = norm_layer(embed_dims[1])
+        self.norm4 = norm_layer(embed_dims[2])
 
-        self.dnorm3 = norm_layer(embed_dims[1])  # 解码器阶段3的LayerNorm
-        self.dnorm4 = norm_layer(embed_dims[0])  # 解码器阶段4的LayerNorm
+        # 解码器部分的归一化层
+        self.dnorm0 = norm_layer(embed_dims[0] // 8)
+        self.dnorm1 = norm_layer(embed_dims[0] // 8)
+        self.dnorm2 = norm_layer(embed_dims[0] // 4)
+        self.dnorm3 = norm_layer(embed_dims[1])
+        self.dnorm4 = norm_layer(embed_dims[0])
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # 为每个深度生成stochastic depth rate
 
-        # 编码器KAN块
-        self.block1 = nn.ModuleList([KANBlock(
-            dim=embed_dims[1],  # 维度为embed_dims[1]
+        # Encoder 的 KAN Block 列表
+        self.block01 = nn.ModuleList([KANBlock(
+            dim=embed_dims[0] // 8,
             drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer
+        )])
+
+        self.block12 = nn.ModuleList([KANBlock(
+            dim=embed_dims[0] // 4,
+            drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer
+        )])
+
+        self.block23 = nn.ModuleList([KANBlock(
+            dim=embed_dims[0],
+            drop=drop_rate, drop_path=dpr[2], norm_layer=norm_layer
+        )])
+
+        self.block1 = nn.ModuleList([KANBlock(
+            dim=embed_dims[1],
+            drop=drop_rate, drop_path=dpr[3], norm_layer=norm_layer
         )])
 
         self.block2 = nn.ModuleList([KANBlock(
-            dim=embed_dims[2],  # 维度为embed_dims[2]（瓶颈层）
-            drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer
+            dim=embed_dims[2],
+            drop=drop_rate, drop_path=dpr[4], norm_layer=norm_layer
         )])
 
-        # 解码器KAN块
+        # Decoder 的 KAN Block 列表
         self.dblock1 = nn.ModuleList([KANBlock(
-            dim=embed_dims[1],  # 维度为embed_dims[1]
-            drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer
+            dim=embed_dims[1],
+            drop=drop_rate, drop_path=dpr[4], norm_layer=norm_layer
         )])
 
         self.dblock2 = nn.ModuleList([KANBlock(
-            dim=embed_dims[0],  # 维度为embed_dims[0]
+            dim=embed_dims[0],
+            drop=drop_rate, drop_path=dpr[3], norm_layer=norm_layer
+        )])
+
+        self.dblock23 = nn.ModuleList([KANBlock(
+            dim=embed_dims[0] // 4,
+            drop=drop_rate, drop_path=dpr[2], norm_layer=norm_layer
+        )])
+
+        self.dblock12 = nn.ModuleList([KANBlock(
+            dim=embed_dims[0] // 8,
             drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer
         )])
 
-        # Patch嵌入层（用于下采样）
-        self.patch_embed3 = PatchEmbed(img_size=img_size // 4, patch_size=3, stride=2, in_chans=embed_dims[0],
-                                       embed_dim=embed_dims[1])  # 下采样2倍
-        self.patch_embed4 = PatchEmbed(img_size=img_size // 8, patch_size=3, stride=2, in_chans=embed_dims[1],
-                                       embed_dim=embed_dims[2])  # 下采样2倍
+        self.dblock01 = nn.ModuleList([KANBlock(
+            dim=embed_dims[0] // 8,
+            drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer
+        )])
 
-        # 解码器：逐步上采样
-        self.decoder1 = D_ConvLayer(embed_dims[2], embed_dims[1])  # 解码器第1层：embed_dims[2] -> embed_dims[1]
-        self.decoder2 = D_ConvLayer(embed_dims[1], embed_dims[0])  # 解码器第2层：embed_dims[1] -> embed_dims[0]
-        self.decoder3 = D_ConvLayer(embed_dims[0], embed_dims[0] // 4)  # 解码器第3层：embed_dims[0] -> embed_dims[0]//4
-        self.decoder4 = D_ConvLayer(embed_dims[0] // 4,
-                                    embed_dims[0] // 8)  # 解码器第4层：embed_dims[0]//4 -> embed_dims[0]//8
-        self.decoder5 = D_ConvLayer(embed_dims[0] // 8, embed_dims[0] // 8)  # 解码器第5层：通道数不变
+        # 解码器卷积层
+        self.decoder1 = D_ConvLayer(embed_dims[2], embed_dims[1])
+        self.decoder2 = D_ConvLayer(embed_dims[1], embed_dims[0])
+        self.decoder3 = D_ConvLayer(embed_dims[0], embed_dims[0] // 4)
+        self.decoder4 = D_ConvLayer(embed_dims[0] // 4, embed_dims[0] // 8)
+        self.decoder5 = D_ConvLayer(embed_dims[0] // 8, embed_dims[0] // 8)
 
-        self.final = nn.Conv2d(embed_dims[0] // 8, num_classes, kernel_size=1)  # 最终1x1卷积输出分割结果
-        self.soft = nn.Softmax(dim=1)  # Softmax激活（未使用）
+        # 1x1 卷积用于调整上采样后的通道数
+        self.upsample1 = nn.Conv2d(in_channels=embed_dims[2], out_channels=embed_dims[1], kernel_size=1)
+        self.upsample2 = nn.Conv2d(in_channels=embed_dims[1], out_channels=embed_dims[0], kernel_size=1)
+        self.upsample3 = nn.Conv2d(in_channels=embed_dims[0], out_channels=embed_dims[0] // 4, kernel_size=1)
+        self.upsample4 = nn.Conv2d(in_channels=embed_dims[0] // 4, out_channels=embed_dims[0] // 8, kernel_size=1)
+        self.upsample5 = nn.Conv2d(in_channels=embed_dims[0] // 8, out_channels=embed_dims[0] // 8, kernel_size=1)
+
+        # 融合阶段使用的 FCSA 注意力模块 (Fusion Stage)
+        self.FCSA1 = FcsAttention(in_channels=embed_dims[0] // 4, out_channels=embed_dims[0] // 4, img_size=img_size)
+        self.FCSA2 = FcsAttention(in_channels=embed_dims[0] // 2, out_channels=embed_dims[0] // 2, img_size=img_size)
+        self.FCSA3 = FcsAttention(in_channels=embed_dims[0] * 2, out_channels=embed_dims[0] * 2, img_size=img_size)
+        self.FCSA4 = FcsAttention(in_channels=embed_dims[1] * 2, out_channels=embed_dims[1] * 2, img_size=img_size)
+
+        # Skip Connection 阶段使用的 FCSA 注意力模块
+        self.FCSA1s = FcsAttention(in_channels=embed_dims[0] // 4, out_channels=embed_dims[0] // 4, img_size=img_size)
+        self.FCSA2s = FcsAttention(in_channels=embed_dims[0] // 2, out_channels=embed_dims[0] // 2, img_size=img_size)
+        self.FCSA3s = FcsAttention(in_channels=embed_dims[0] * 2, out_channels=embed_dims[0] * 2, img_size=img_size)
+        self.FCSA4s = FcsAttention(in_channels=embed_dims[1] * 2, out_channels=embed_dims[1] * 2, img_size=img_size)
+
+        # 通道降维层 (s后缀对应 Skip Connection 处理)
+        self.backdim1s = ChannelLinear(in_channels=embed_dims[0] // 4, out_channels=embed_dims[0] // 8)
+        self.backdim2s = ChannelLinear(in_channels=embed_dims[0] // 2, out_channels=embed_dims[0] // 4)
+        self.backdim3s = ChannelLinear(in_channels=embed_dims[0] * 2, out_channels=embed_dims[0])
+        self.backdim4s = ChannelLinear(in_channels=embed_dims[1] * 2, out_channels=embed_dims[1])
+
+        # 通道降维层 (对应 Fusion 阶段)
+        self.backdim1 = ChannelLinear(in_channels=embed_dims[0] // 4, out_channels=embed_dims[0] // 8)
+        self.backdim2 = ChannelLinear(in_channels=embed_dims[0] // 2, out_channels=embed_dims[0] // 4)
+        self.backdim3 = ChannelLinear(in_channels=embed_dims[0] * 2, out_channels=embed_dims[0])
+        self.backdim4 = ChannelLinear(in_channels=embed_dims[1] * 2, out_channels=embed_dims[1])
+
+        # 最终输出层
+        self.final = nn.Conv2d(embed_dims[0] // 8, num_classes, kernel_size=1)
+        self.soft = nn.Softmax(dim=1)
 
     def forward(self, x):
         """前向传播"""
-        B = x.shape[0]  # batch size
-        ### 编码器
-        ### 卷积阶段
+        B = x.shape[0]
 
-        ### 阶段1
-        out = F.relu(F.max_pool2d(self.encoder1(x), 2, 2))  # encoder1 + maxpool下采样 + ReLU
-        t1 = out  # 保存用于跳跃连接
-        ### 阶段2
-        out = F.relu(F.max_pool2d(self.encoder2(out), 2, 2))  # encoder2 + maxpool下采样 + ReLU
-        t2 = out  # 保存用于跳跃连接
-        ### 阶段3
-        out = F.relu(F.max_pool2d(self.encoder3(out), 2, 2))  # encoder3 + maxpool下采样 + ReLU
-        t3 = out  # 保存用于跳跃连接
-
-        ### Tokenized KAN阶段
-        ### 阶段4
-
-        out, H, W = self.patch_embed3(out)  # Patch嵌入，转换为token序列
-        for i, blk in enumerate(self.block1):  # 通过KAN块
+        ### Stage 1 (Encoder)
+        out, H, W = self.patch_embed0(x)
+        for i, blk in enumerate(self.block01):
             out = blk(out, H, W)
-        out = self.norm3(out)  # LayerNorm
-        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()  # (B,N,C) -> (B,C,H,W)
-        t4 = out  # 保存用于跳跃连接
+        out = self.norm0(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        t1 = out  # 保存 skip connection 特征 t1
 
-        ### 瓶颈层
-
-        out, H, W = self.patch_embed4(out)  # Patch嵌入，进一步下采样
-        for i, blk in enumerate(self.block2):  # 通过瓶颈KAN块
+        ### Stage 2 (Encoder)
+        out, H, W = self.patch_embed1(out)
+        for i, blk in enumerate(self.block12):
             out = blk(out, H, W)
-        out = self.norm4(out)  # LayerNorm
-        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()  # 转换回(B,C,H,W)
+        out = self.norm1(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        t2 = out  # 保存 skip connection 特征 t2
 
-        ### 解码器
-        ### 阶段4
-        out = F.relu(
-            F.interpolate(self.decoder1(out), scale_factor=(2, 2), mode='bilinear'))  # decoder1 + 双线性上采样2倍 + ReLU
-
-        out = torch.add(out, t4)  # 跳跃连接：与t4相加
-        _, _, H, W = out.shape  # 获取当前空间维度
-        out = out.flatten(2).transpose(1, 2)  # 转换为token格式(B,N,C)
-        for i, blk in enumerate(self.dblock1):  # 通过解码器KAN块
+        ### Stage 3 (Encoder)
+        out, H, W = self.patch_embed2(out)
+        for i, blk in enumerate(self.block23):
             out = blk(out, H, W)
+        out = self.norm2(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        t3 = out  # 保存 skip connection 特征 t3
 
-        ### 阶段3
-        out = self.dnorm3(out)  # LayerNorm
-        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()  # 转换回(B,C,H,W)
-        out = F.relu(F.interpolate(self.decoder2(out), scale_factor=(2, 2), mode='bilinear'))  # decoder2 + 上采样 + ReLU
-        out = torch.add(out, t3)  # 跳跃连接：与t3相加
+        ### Stage 4 (Encoder)
+        out, H, W = self.patch_embed3(out)
+        for i, blk in enumerate(self.block1):
+            out = blk(out, H, W)
+        out = self.norm3(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        t4 = out  # 保存 skip connection 特征 t4
+
+        ### Bottleneck (瓶颈层)
+        out, H, W = self.patch_embed4(out)
+        for i, blk in enumerate(self.block2):
+            out = blk(out, H, W)
+        out = self.norm4(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        p5 = out  # 瓶颈层特征 p5
+
+        ### Decoder Stage 4 (第一阶段解码)
+        # 上采样并进行卷积
+        out = F.relu(F.interpolate(self.decoder1(out), scale_factor=(2, 2), mode='bilinear'))
+
+        # 与 t4 进行拼接 (Skip Connection)
+        # out = torch.add(out, t4)
+        out = torch.cat((out, t4), dim=1)
+        # 注意力机制 + 通道调整
+        out = self.FCSA4s(out)
+        out = self.backdim4s(out)
+
+        # 通过 KAN Block 进行特征处理
         _, _, H, W = out.shape
-        out = out.flatten(2).transpose(1, 2)  # 转换为token格式
-
-        for i, blk in enumerate(self.dblock2):  # 通过解码器KAN块
+        out = out.flatten(2).transpose(1, 2)
+        for i, blk in enumerate(self.dblock1):
             out = blk(out, H, W)
 
-        out = self.dnorm4(out)  # LayerNorm
-        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()  # 转换回(B,C,H,W)
+        ### Decoder Stage 3
+        out = self.dnorm3(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        p4 = out  # 获得 p4 特征
 
-        ### 剩余解码阶段（纯卷积）
-        out = F.relu(F.interpolate(self.decoder3(out), scale_factor=(2, 2), mode='bilinear'))  # decoder3 + 上采样 + ReLU
-        out = torch.add(out, t2)  # 跳跃连接：与t2相加
-        out = F.relu(F.interpolate(self.decoder4(out), scale_factor=(2, 2), mode='bilinear'))  # decoder4 + 上采样 + ReLU
-        out = torch.add(out, t1)  # 跳跃连接：与t1相加
-        out = F.relu(F.interpolate(self.decoder5(out), scale_factor=(2, 2), mode='bilinear'))  # decoder5 + 上采样 + ReLU
+        out = F.relu(F.interpolate(self.decoder2(out), scale_factor=(2, 2), mode='bilinear'))
+        # 与 t3 拼接
+        # out = torch.add(out, t3)
+        out = torch.cat((out, t3), dim=1)
+        out = self.FCSA3s(out)
+        out = self.backdim3s(out)
 
-        return self.final(out)  # 最终1x1卷积输出分割图
+        _, _, H, W = out.shape
+        out = out.flatten(2).transpose(1, 2)
+
+        for i, blk in enumerate(self.dblock2):
+            out = blk(out, H, W)
+
+        out = self.dnorm4(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        p3 = out  # 获得 p3 特征
+
+        ### Decoder Stage 2
+        out = F.relu(F.interpolate(self.decoder3(out), scale_factor=(2, 2), mode='bilinear'))
+        # 与 t2 拼接
+        # out = torch.add(out, t2)
+        out = torch.cat((out, t2), dim=1)
+        out = self.FCSA2s(out)
+        out = self.backdim2s(out)
+
+        _, _, H, W = out.shape
+        out = out.flatten(2).transpose(1, 2)
+
+        for i, blk in enumerate(self.dblock23):
+            out = blk(out, H, W)
+
+        out = self.dnorm2(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        p2 = out  # 获得 p2 特征
+
+        ### Decoder Stage 1
+        out = F.relu(F.interpolate(self.decoder4(out), scale_factor=(2, 2), mode='bilinear'))
+        # 与 t1 拼接
+        # out = torch.add(out, t1)
+        out = torch.cat((out, t1), dim=1)
+        out = self.FCSA1s(out)
+        out = self.backdim1s(out)
+
+        _, _, H, W = out.shape
+        out = out.flatten(2).transpose(1, 2)
+
+        for i, blk in enumerate(self.dblock12):
+            out = blk(out, H, W)
+
+        out = self.dnorm1(out)
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        p1 = out  # 获得 p1 特征
+
+        ### Fusion / Reconstruction Path (第二阶段解码/融合)
+        # 将 p5-p1 特征逐级上采样并融合
+        out = self.upsample1(p5)
+        out = F.relu(F.interpolate(out, scale_factor=(2, 2), mode='nearest'))
+        out = torch.cat((out, p4), dim=1)
+        out = self.FCSA4(out)
+        out = self.backdim4(out)
+
+        out = self.upsample2(out)
+        out = F.relu(F.interpolate(out, scale_factor=(2, 2), mode='nearest'))
+        out = torch.cat((out, p3), dim=1)
+        out = self.FCSA3(out)
+        out = self.backdim3(out)
+
+        out = self.upsample3(out)
+        out = F.relu(F.interpolate(out, scale_factor=(2, 2), mode='nearest'))
+        out = torch.cat((out, p2), dim=1)
+        out = self.FCSA2(out)
+        out = self.backdim2(out)
+
+        out = self.upsample4(out)
+        out = F.relu(F.interpolate(out, scale_factor=(2, 2), mode='nearest'))
+        out = torch.cat((out, p1), dim=1)
+        out = self.FCSA1(out)
+        out = self.backdim1(out)
+
+        # 最终处理和分类
+        out = F.relu(F.interpolate(self.decoder5(out), scale_factor=(2, 2), mode='bilinear'))
+
+        return self.final(out)
