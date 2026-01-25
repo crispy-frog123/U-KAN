@@ -1,161 +1,143 @@
-#! /data/cxli/miniconda3/envs/th200/bin/python
-import argparse
+import sys
+
+sys.path.insert(0, r'E:\U-KAN')
+
 import os
-from glob import glob
-import random
-import numpy as np
-
-import cv2
 import torch
-import torch.backends.cudnn as cudnn
+import numpy as np
+import matplotlib.pyplot as plt
 import yaml
-from albumentations import transforms
-from albumentations.core.composition import Compose
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-from collections import OrderedDict
-
 import archs
+from dataset_e import ComplexMatDataset
+from albumentations import Resize
+from albumentations.core.composition import Compose
 
-from dataset import Dataset
-from metrics import iou_score
-from utils import AverageMeter
-from albumentations import RandomRotate90,Resize
-import time
+# ========== 直接在这里改路径 ==========
+MODEL_PATH = r'outputs\test2_UKAN_woDS\model.pth'
+CONFIG_PATH = r'outputs\test2_UKAN_woDS\config.yml'
+NUM_SAMPLES = 3
+SAVE_PATH = 'predictions.png'
+# ====================================
 
-from PIL import Image
+print("=" * 60)
+print("生成预测对比图")
+print("=" * 60)
 
-def parse_args():
-    parser = argparse.ArgumentParser()
+# 加载配置
+with open(CONFIG_PATH, 'r') as f:
+    config = yaml.safe_load(f)
 
-    parser.add_argument('--name', default=None, help='model name')
-    parser.add_argument('--output_dir', default='outputs', help='ouput dir')
-            
-    args = parser.parse_args()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}\n")
 
-    return args
-
-def seed_torch(seed=1029):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+# 加载数据
+print("加载数据集...")
 
 
-def main():
-    seed_torch()
-    args = parse_args()
-
-    with open(f'{args.output_dir}/{args.name}/config.yml', 'r') as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
-
-    print('-'*20)
-    for key in config.keys():
-        print('%s: %s' % (key, str(config[key])))
-    print('-'*20)
-
-    cudnn.benchmark = True
-
-    model = archs.__dict__[config['arch']](config['num_classes'], config['input_channels'], config['deep_supervision'], embed_dims=config['input_list'])
-
-    model = model.cuda()
-
-    dataset_name = config['dataset']
-    img_ext = '.png'
-
-    if dataset_name == 'busi':
-        mask_ext = '_mask.png'
-    elif dataset_name == 'glas':
-        mask_ext = '.png'
-    elif dataset_name == 'cvc':
-        mask_ext = '.png'
-
-    # Data loading code
-    img_ids = sorted(glob(os.path.join(config['data_dir'], config['dataset'], 'images', '*' + img_ext)))
-    # img_ids.sort()
-    img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
-
-    _, val_img_ids = train_test_split(img_ids, test_size=0.2, random_state=config['dataseed'])
-
-    ckpt = torch.load(f'{args.output_dir}/{args.name}/model.pth')
-
-    try:        
-        model.load_state_dict(ckpt)
-    except:
-        print("Pretrained model keys:", ckpt.keys())
-        print("Current model keys:", model.state_dict().keys())
-
-        pretrained_dict = {k: v for k, v in ckpt.items() if k in model.state_dict()}
-        current_dict = model.state_dict()
-        diff_keys = set(current_dict.keys()) - set(pretrained_dict.keys())
-
-        print("Difference in model keys:")
-        for key in diff_keys:
-            print(f"Key: {key}")
-
-        model.load_state_dict(ckpt, strict=False)
-        
-    model.eval()
-
-    val_transform = Compose([
-        Resize(config['input_h'], config['input_w']),
-        transforms.Normalize(),
-    ])
-
-    val_dataset = Dataset(
-        img_ids=val_img_ids,
-        img_dir=os.path.join(config['data_dir'], config['dataset'], 'images'),
-        mask_dir=os.path.join(config['data_dir'], config['dataset'], 'masks'),
-        img_ext=img_ext,
-        mask_ext=mask_ext,
-        num_classes=config['num_classes'],
-        transform=val_transform)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=config['num_workers'],
-        drop_last=False)
-
-    iou_avg_meter = AverageMeter()
-    dice_avg_meter = AverageMeter()
-    hd95_avg_meter = AverageMeter()
-
-    with torch.no_grad():
-        for input, target, meta in tqdm(val_loader, total=len(val_loader)):
-            input = input.cuda()
-            target = target.cuda()
-            model = model.cuda()
-            # compute output
-            output = model(input)
-
-            iou, dice, hd95_ = iou_score(output, target)
-            iou_avg_meter.update(iou, input.size(0))
-            dice_avg_meter.update(dice, input.size(0))
-            hd95_avg_meter.update(hd95_, input.size(0))
-
-            output = torch.sigmoid(output).cpu().numpy()
-            output[output>=0.5]=1
-            output[output<0.5]=0
-
-            os.makedirs(os.path.join(args.output_dir, config['name'], 'out_val'), exist_ok=True)
-            for pred, img_id in zip(output, meta['img_id']):
-                pred_np = pred[0].astype(np.uint8)
-                pred_np = pred_np * 255
-                img = Image.fromarray(pred_np, 'L')
-                img.save(os.path.join(args.output_dir, config['name'], 'out_val/{}.jpg'.format(img_id)))
-
-    
-    print(config['name'])
-    print('IoU: %.4f' % iou_avg_meter.avg)
-    print('Dice: %.4f' % dice_avg_meter.avg)
-    print('HD95: %.4f' % hd95_avg_meter.avg)
+def build_path(base_dir, file_path):
+    if os.path.isabs(file_path):
+        return file_path
+    else:
+        return os.path.normpath(os.path.join(base_dir, file_path))
 
 
+real_img_path = build_path(config['data_dir'], config['real_img_file'])
+imag_img_path = build_path(config['data_dir'], config['imag_img_file'])
+real_mask_path = build_path(config['data_dir'], config['real_mask_file'])
+imag_mask_path = build_path(config['data_dir'], config['imag_mask_file'])
 
-if __name__ == '__main__':
-    main()
+val_transform = Compose([Resize(config['input_h'], config['input_w'])])
+
+dataset = ComplexMatDataset(
+    real_img_path=real_img_path,
+    imag_img_path=imag_img_path,
+    real_mask_path=real_mask_path,
+    imag_mask_path=imag_mask_path,
+    img_size=(config['original_img_size'], config['original_img_size']),
+    transform=val_transform,
+    normalize_method='z-score'
+)
+
+print(f"✓ 数据集大小: {len(dataset)}\n")
+
+
+# 创建模型
+# 创建模型
+print("\n创建模型...")
+model = archs.__dict__[config['arch']](
+    config['num_classes'],
+    config['input_channels'],
+    config['deep_supervision'],
+    embed_dims=config['input_list'],
+    no_kan=config['no_kan']
+).to(device)
+
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+model.eval()
+print("✓ 模型加载成功\n")
+
+# 预测
+print(f"生成 {NUM_SAMPLES} 个样本的预测...")
+
+fig, axes = plt.subplots(NUM_SAMPLES, 6, figsize=(18, 3 * NUM_SAMPLES))
+if NUM_SAMPLES == 1:
+    axes = axes.reshape(1, -1)
+
+with torch.no_grad():
+    for i in range(NUM_SAMPLES):
+        # 随机选择样本
+        idx = np.random.randint(0, len(dataset))
+        img, mask_gt, _ = dataset[idx]
+
+        # 预测
+        img_input = img.unsqueeze(0).to(device)
+
+        if config['deep_supervision']:
+            outputs = model(img_input)
+            mask_pred = outputs[-1]
+        else:
+            mask_pred = model(img_input)
+
+        # 转numpy
+        img_np = img.cpu().numpy()
+        mask_gt_np = mask_gt.cpu().numpy()
+        mask_pred_np = mask_pred[0].cpu().numpy()
+
+        # 实部
+        axes[i, 0].imshow(img_np[0], cmap='seismic')
+        axes[i, 0].set_title(f'Sample {idx}\nInput Real', fontsize=9)
+        axes[i, 0].axis('off')
+
+        axes[i, 1].imshow(mask_gt_np[0], cmap='seismic')
+        axes[i, 1].set_title('Mask Real', fontsize=9)
+        axes[i, 1].axis('off')
+
+        axes[i, 2].imshow(mask_pred_np[0], cmap='seismic')
+        axes[i, 2].set_title('Pred Real', fontsize=9)
+        axes[i, 2].axis('off')
+
+        # 虚部
+        axes[i, 3].imshow(img_np[1], cmap='seismic')
+        axes[i, 3].set_title('Input Imag', fontsize=9)
+        axes[i, 3].axis('off')
+
+        axes[i, 4].imshow(mask_gt_np[1], cmap='seismic')
+        axes[i, 4].set_title('Mask Imag', fontsize=9)
+        axes[i, 4].axis('off')
+
+        axes[i, 5].imshow(mask_pred_np[1], cmap='seismic')
+        axes[i, 5].set_title('Pred Imag', fontsize=9)
+        axes[i, 5].axis('off')
+
+        # 计算MSE
+        mse_real = np.mean((mask_pred_np[0] - mask_gt_np[0]) ** 2)
+        mse_imag = np.mean((mask_pred_np[1] - mask_gt_np[1]) ** 2)
+
+        print(f"  样本 {i + 1}: MSE_real={mse_real:.6f}, MSE_imag={mse_imag:.6f}")
+
+plt.tight_layout()
+plt.savefig(SAVE_PATH, dpi=150, bbox_inches='tight')
+
+print(f"\n{'=' * 60}")
+print(f"✓ 已保存到: {SAVE_PATH}")
+print(f"{'=' * 60}")

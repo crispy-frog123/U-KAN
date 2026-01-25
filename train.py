@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
 from collections import OrderedDict
 from glob import glob
 import random
@@ -21,7 +22,6 @@ from tqdm import tqdm
 from albumentations import RandomRotate90, Resize
 
 import archs
-import losses
 from dataset_e import ComplexMatDataset, TransformSubset
 from utils import AverageMeter, str2bool
 from torch.utils.tensorboard import SummaryWriter
@@ -32,8 +32,6 @@ import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 
 ARCH_NAMES = archs.__all__
-LOSS_NAMES = losses.__all__
-LOSS_NAMES.append('BCEWithLogitsLoss')
 
 
 def list_type(s):
@@ -47,7 +45,7 @@ def parse_args():
 
     parser.add_argument('--name', default=None,
                         help='model name: (default: arch+timestamp)')
-    parser.add_argument('--epochs', default=50, type=int, metavar='N',
+    parser.add_argument('--epochs', default=400, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('-b', '--batch_size', default=8, type=int,
                         metavar='N', help='mini-batch size (default: 8)')
@@ -64,9 +62,9 @@ def parse_args():
     parser.add_argument('--num_classes', default=2, type=int,
                         help='number of classes')
 
-    parser.add_argument('--input_w', default=256, type=int,
+    parser.add_argument('--input_w', default=64, type=int,
                         help='image width')
-    parser.add_argument('--input_h', default=256, type=int,
+    parser.add_argument('--input_h', default=64, type=int,
                         help='image height')
     parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
 
@@ -77,18 +75,18 @@ def parse_args():
     # 复数数据集路径
     parser.add_argument('--data_dir', default='inputs', help='dataset base directory')
 
-    parser.add_argument('--real_img_file', default='input/chi_all_real_64.mat',
+    parser.add_argument('--real_img_file', default='input/chi0_all_real_64.mat',
                         help='real part image .mat file')
-    parser.add_argument('--imag_img_file', default='input/chi_all_imag_64.mat',
+    parser.add_argument('--imag_img_file', default='input/chi0_all_imag_64.mat',
                         help='imaginary part image .mat file')
-    parser.add_argument('--real_mask_file', default='label/chi0_all_real_64.mat',
+    parser.add_argument('--real_mask_file', default='label/chi_all_real_64.mat',
                         help='real part mask .mat file')
-    parser.add_argument('--imag_mask_file', default='label/chi0_all_imag_64.mat',
+    parser.add_argument('--imag_mask_file', default='label/chi_all_imag_64.mat',
                         help='imaginary part mask .mat file')
 
-    parser.add_argument('--img_var_name', default='chi_all_real',
+    parser.add_argument('--img_var_name', default='chi0_all_real',
                         help='variable name in .mat file for images')
-    parser.add_argument('--mask_var_name', default='chi0_all_real',
+    parser.add_argument('--mask_var_name', default='chi_all_real',
                         help='variable name in .mat file for masks')
 
     parser.add_argument('--original_img_size', default=64, type=int,
@@ -126,8 +124,8 @@ def parse_args():
     parser.add_argument('--patience', default=5, type=int)
     parser.add_argument('--milestones', default='1,2', type=str)
     parser.add_argument('--gamma', default=2 / 3, type=float)
-    parser.add_argument('--early_stopping', default=20, type=int,
-                        metavar='N', help='early stopping (default: 20)')
+    parser.add_argument('--early_stopping', default=60, type=int,
+                        metavar='N', help='early stopping (default: 60)')
 
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--no_kan', action='store_true')
@@ -157,10 +155,15 @@ def train(config, train_loader, model, criterion, optimizer):
         # Forward
         if config['deep_supervision']:
             outputs = model(input)
+            # Deep Supervision 加权 Loss
+            # outputs 顺序: [p2, p1, final]
+            # 权重策略: 辅助头 0.4, 主头 1.0
+            weights = [0.4, 0.4, 1.0]
             loss = 0
-            for output in outputs:
-                loss += criterion(output, target)
-            loss /= len(outputs)
+            # 使用 zip 同时遍历输出和权重
+            for output_item, weight in zip(outputs, weights):
+                loss += weight * criterion(output_item, target)
+            # 取最后一个作为最终输出，用于计算后面的 MSE/MAE 指标
             output = outputs[-1]
         else:
             output = model(input)
@@ -224,10 +227,10 @@ def validate(config, val_loader, model, criterion):
             # Forward
             if config['deep_supervision']:
                 outputs = model(input)
+                weights = [0.4, 0.4, 1.0]
                 loss = 0
-                for output in outputs:
-                    loss += criterion(output, target)
-                loss /= len(outputs)
+                for output_item, weight in zip(outputs, weights):
+                    loss += weight * criterion(output_item, target)
                 output = outputs[-1]
             else:
                 output = model(input)
@@ -285,9 +288,9 @@ def main():
     # 自动生成实验名
     if config['name'] is None:
         if config['deep_supervision']:
-            config['name'] = 'regression_%s_wDS' % config['arch']
+            config['name'] = 'test2_%s_wDS' % config['arch']
         else:
-            config['name'] = 'regression_%s_woDS' % config['arch']
+            config['name'] = 'test2_%s_woDS' % config['arch']
         exp_name = config['name']
 
     os.makedirs(f'{output_dir}/{exp_name}', exist_ok=True)
@@ -524,6 +527,12 @@ def main():
     print("开始训练（回归任务）")
     print("=" * 60 + "\n")
 
+    # 因为是误差，所以初始值设为无穷大 (float('inf'))，越小越好
+    best_loss = float('inf')
+    best_mae = float('inf')
+    best_mse = float('inf')
+    best_rmse = float('inf')
+    trigger = 0  # 早停计数器
     for epoch in range(config['epochs']):
         print(f'\nEpoch [{epoch}/{config["epochs"]}]')
         print('-' * 60)
@@ -533,6 +542,36 @@ def main():
 
         # Validate
         val_log = validate(config, val_loader, model, criterion)
+        # 如果当前的 MAE 比历史最好的还小，就更新历史最好
+        if val_log['mae'] < best_mae: best_mae = val_log['mae']
+        if val_log['mse'] < best_mse: best_mse = val_log['mse']
+        if val_log['rmse'] < best_rmse: best_rmse = val_log['rmse']
+
+        # 【核心早停逻辑】 这里我们以 Loss (总误差) 为主要标准来决定要不要保存模型
+        if val_log['loss'] < best_loss:
+            print(f"=> [Epoch {epoch}] Saved best model! (val_loss: {val_log['loss']:.6f})")
+
+            # 更新最好 Loss
+            best_loss = val_log['loss']
+
+            # 保存模型文件
+            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
+
+            # 既然进步了，计数器归零
+            trigger = 0
+        else:
+            # 没进步，计数器 +1
+            trigger += 1
+            print(f"=> No improvement for {trigger} epochs.")
+
+        # 打印一下当前的最好模型
+        print(
+            f'   Best Results -> Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f}')
+
+        # 触发早停（Early Stopping）
+        if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
+            print(f"=> Early stopping triggered! (Best Loss: {best_loss:.6f})")
+            break
 
         # 更新学习率
         if config['scheduler'] == 'CosineAnnealingLR':
@@ -571,20 +610,11 @@ def main():
         my_writer.add_scalar('val/mae', val_log['mae'], epoch)
         my_writer.add_scalar('val/rmse', val_log['rmse'], epoch)
         my_writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        my_writer.add_scalar('best/loss', best_loss, epoch)
+        my_writer.add_scalar('best/mae', best_mae, epoch)
+        my_writer.add_scalar('best/mse', best_mse, epoch)
+        my_writer.add_scalar('best/rmse', best_rmse, epoch)
 
-        # 保存最佳模型
-        if val_log['loss'] < best_loss:
-            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
-            best_loss = val_log['loss']
-            print(f"\n=> Saved best model (val_loss: {best_loss:.6f})")
-            trigger = 0
-        else:
-            trigger += 1
-
-        # Early stopping
-        if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
-            print(f"\n=> Early stopping triggered (no improvement for {trigger} epochs)")
-            break
 
         torch.cuda.empty_cache()
 
