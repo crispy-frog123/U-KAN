@@ -124,11 +124,15 @@ def parse_args():
     parser.add_argument('--patience', default=5, type=int)
     parser.add_argument('--milestones', default='1,2', type=str)
     parser.add_argument('--gamma', default=2 / 3, type=float)
-    parser.add_argument('--early_stopping', default=60, type=int,
-                        metavar='N', help='early stopping (default: 60)')
+    parser.add_argument('--early_stopping', default=100, type=int,
+                        metavar='N', help='early stopping (default: 100)')
 
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--no_kan', action='store_true')
+
+    # [新增] 断点续训参数
+    parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                        help='path to latest checkpoint (default: none)')
 
     config = parser.parse_args()
 
@@ -527,13 +531,33 @@ def main():
     print("开始训练（回归任务）")
     print("=" * 60 + "\n")
 
-    # 因为是误差，所以初始值设为无穷大 (float('inf'))，越小越好
+    # 初始值设为无穷大
     best_loss = float('inf')
     best_mae = float('inf')
     best_mse = float('inf')
     best_rmse = float('inf')
     trigger = 0  # 早停计数器
-    for epoch in range(config['epochs']):
+    # 【新增】断点续训加载逻辑
+    start_epoch = 0
+    if config['resume']:
+        if os.path.isfile(config['resume']):
+            print(f"=> loading checkpoint '{config['resume']}'")
+            checkpoint = torch.load(config['resume'])
+            start_epoch = checkpoint['epoch'] + 1  # 从下一轮开始
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+
+            # 恢复历史最佳指标，防止刚恢复训练就误判为“历史最佳”
+            best_loss = checkpoint.get('best_loss', best_loss)
+            best_mae = checkpoint.get('best_mae', best_mae)
+            best_mse = checkpoint.get('best_mse', best_mse)
+            best_rmse = checkpoint.get('best_rmse', best_rmse)
+
+            # 恢复 Scheduler (如果存在)
+            if scheduler is not None and 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            print(f"=> loaded checkpoint (epoch {checkpoint['epoch']})")
+    for epoch in range(start_epoch,config['epochs']):
         print(f'\nEpoch [{epoch}/{config["epochs"]}]')
         print('-' * 60)
 
@@ -585,6 +609,19 @@ def main():
             f"  Train - Loss: {train_log['loss']:.6f}, MSE: {train_log['mse']:.6f}, MAE: {train_log['mae']:.6f}, RMSE: {train_log['rmse']:.6f}")
         print(
             f"  Val   - Loss: {val_log['loss']:.6f}, MSE: {val_log['mse']:.6f}, MAE: {val_log['mae']:.6f}, RMSE: {val_log['rmse']:.6f}")
+
+        # 【新增】保存最新的 Checkpoint (包含恢复训练所需的所有信息)
+        checkpoint_state = {
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict() if scheduler else None,
+            'best_loss': best_loss,
+            'best_mae': best_mae,
+            'best_mse': best_mse,
+            'best_rmse': best_rmse
+        }
+        torch.save(checkpoint_state, f'{output_dir}/{exp_name}/checkpoint_latest.pth')
 
         # 记录日志
         log['epoch'].append(epoch)
