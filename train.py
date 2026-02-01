@@ -55,7 +55,7 @@ def parse_args():
 
     # model
     parser.add_argument('--arch', '-a', metavar='ARCH', default='UKAN')
-    parser.add_argument('--deep_supervision', default=False, type=str2bool)
+    parser.add_argument('--deep_supervision', default=True, type=str2bool)
 
     parser.add_argument('--input_channels', default=2, type=int,
                         help='input channels ')
@@ -75,13 +75,15 @@ def parse_args():
     # 复数数据集路径
     parser.add_argument('--data_dir', default='inputs', help='dataset base directory')
 
-    parser.add_argument('--real_img_file', default='input/chi0_all_real_64.mat',
+    parser.add_argument('--real_img_file', default='input\chi0_all_real_mnist.mat'
+                                                   ''
+                                                   '',
                         help='real part image .mat file')
-    parser.add_argument('--imag_img_file', default='input/chi0_all_imag_64.mat',
+    parser.add_argument('--imag_img_file', default='input/chi0_all_imag_mnist.mat',
                         help='imaginary part image .mat file')
-    parser.add_argument('--real_mask_file', default='label/chi_all_real_64.mat',
+    parser.add_argument('--real_mask_file', default='label/chi_all_real_mnist.mat',
                         help='real part mask .mat file')
-    parser.add_argument('--imag_mask_file', default='label/chi_all_imag_64.mat',
+    parser.add_argument('--imag_mask_file', default='label/chi_all_imag_mnist.mat',
                         help='imaginary part mask .mat file')
 
     parser.add_argument('--img_var_name', default='chi0_all_real',
@@ -124,15 +126,11 @@ def parse_args():
     parser.add_argument('--patience', default=5, type=int)
     parser.add_argument('--milestones', default='1,2', type=str)
     parser.add_argument('--gamma', default=2 / 3, type=float)
-    parser.add_argument('--early_stopping', default=100, type=int,
-                        metavar='N', help='early stopping (default: 100)')
+    parser.add_argument('--early_stopping', default=60, type=int,
+                        metavar='N', help='early stopping (default: 60)')
 
-    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--no_kan', action='store_true')
-
-    # [新增] 断点续训参数
-    parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                        help='path to latest checkpoint (default: none)')
 
     config = parser.parse_args()
 
@@ -292,9 +290,9 @@ def main():
     # 自动生成实验名
     if config['name'] is None:
         if config['deep_supervision']:
-            config['name'] = 'test2_%s_wDS' % config['arch']
+            config['name'] = 'test3_%s_wDS' % config['arch']
         else:
-            config['name'] = 'test2_%s_woDS' % config['arch']
+            config['name'] = 'test3_%s_woDS' % config['arch']
         exp_name = config['name']
 
     os.makedirs(f'{output_dir}/{exp_name}', exist_ok=True)
@@ -531,33 +529,13 @@ def main():
     print("开始训练（回归任务）")
     print("=" * 60 + "\n")
 
-    # 初始值设为无穷大
+    # 因为是误差，所以初始值设为无穷大 (float('inf'))，越小越好
     best_loss = float('inf')
     best_mae = float('inf')
     best_mse = float('inf')
     best_rmse = float('inf')
     trigger = 0  # 早停计数器
-    # 【新增】断点续训加载逻辑
-    start_epoch = 0
-    if config['resume']:
-        if os.path.isfile(config['resume']):
-            print(f"=> loading checkpoint '{config['resume']}'")
-            checkpoint = torch.load(config['resume'])
-            start_epoch = checkpoint['epoch'] + 1  # 从下一轮开始
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-
-            # 恢复历史最佳指标，防止刚恢复训练就误判为“历史最佳”
-            best_loss = checkpoint.get('best_loss', best_loss)
-            best_mae = checkpoint.get('best_mae', best_mae)
-            best_mse = checkpoint.get('best_mse', best_mse)
-            best_rmse = checkpoint.get('best_rmse', best_rmse)
-
-            # 恢复 Scheduler (如果存在)
-            if scheduler is not None and 'scheduler' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler'])
-            print(f"=> loaded checkpoint (epoch {checkpoint['epoch']})")
-    for epoch in range(start_epoch,config['epochs']):
+    for epoch in range(config['epochs']):
         print(f'\nEpoch [{epoch}/{config["epochs"]}]')
         print('-' * 60)
 
@@ -610,19 +588,6 @@ def main():
         print(
             f"  Val   - Loss: {val_log['loss']:.6f}, MSE: {val_log['mse']:.6f}, MAE: {val_log['mae']:.6f}, RMSE: {val_log['rmse']:.6f}")
 
-        # 【新增】保存最新的 Checkpoint (包含恢复训练所需的所有信息)
-        checkpoint_state = {
-            'epoch': epoch,
-            'state_dict': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict() if scheduler else None,
-            'best_loss': best_loss,
-            'best_mae': best_mae,
-            'best_mse': best_mse,
-            'best_rmse': best_rmse
-        }
-        torch.save(checkpoint_state, f'{output_dir}/{exp_name}/checkpoint_latest.pth')
-
         # 记录日志
         log['epoch'].append(epoch)
         log['lr'].append(optimizer.param_groups[0]['lr'])
@@ -660,6 +625,27 @@ def main():
     print("=" * 60)
 
     my_writer.close()
+    # ================= 保存最佳结果到 txt 文件 =================
+    result_path = f'{output_dir}/{exp_name}/best_results.txt'
+
+    print(f"正在保存最佳指标到: {result_path}")
+
+    with open(result_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 40 + "\n")
+        f.write(f"Experiment: {exp_name}\n")
+        f.write(f"Finished at Epoch: {config['epochs']}\n")
+        f.write("=" * 40 + "\n\n")
+
+        f.write("Best Metrics during Training:\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Best Loss: {best_loss:.8f}\n")
+        f.write(f"Best MSE:  {best_mse:.8f}\n")
+        f.write(f"Best MAE:  {best_mae:.8f}\n")
+        f.write(f"Best RMSE: {best_rmse:.8f}\n")
+        f.write("-" * 30 + "\n")
+
+    print("✓ 结果已保存")
+    # ==============================================================
 
 
 if __name__ == '__main__':
