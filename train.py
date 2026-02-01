@@ -66,7 +66,7 @@ def parse_args():
                         help='image width')
     parser.add_argument('--input_h', default=64, type=int,
                         help='image height')
-    parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
+    parser.add_argument('--input_list', type=list_type, default=[64, 96, 128])
 
     # loss
     parser.add_argument('--loss', default='MSELoss',
@@ -475,8 +475,26 @@ def main():
     np.random.seed(config['dataseed'])
     np.random.shuffle(indices)
 
-    split = int(np.floor(config['val_split'] * dataset_size))
-    train_indices, val_indices = indices[split:], indices[:split]
+    # Test:  0   - 199   (10%) -> 留给 test.py 用，
+    # Val:   200 - 399   (10%) -> 用于验证
+    # Train: 400 - 1999  (80%) -> 用于训练
+
+    test_split = int(np.floor(0.1 * dataset_size))  # 10%
+    val_split = int(np.floor(0.1 * dataset_size))  # 10%
+
+    test_indices = indices[:test_split]  # 0~199
+    val_indices = indices[test_split: test_split + val_split]  # 200~399
+    train_indices = indices[test_split + val_split:]  # 400~1999
+
+    # train.py 只需要用到 train 和 val
+    train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
+    val_dataset = TransformSubset(full_dataset, val_indices, val_transform)
+
+    print(f"\nDataset split (8:1:1):")
+    print(f"  Total:      {dataset_size}")
+    print(f"  Training:   {len(train_dataset)} (用于训练)")
+    print(f"  Validation: {len(val_dataset)} (用于早停)")
+    print(f"  Test:       {len(test_indices)} (保留给 test.py)")
 
     # 创建Subset
     train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
