@@ -23,7 +23,7 @@ from albumentations import RandomRotate90, Resize
 
 import archs
 from dataset_e import ComplexMatDataset, TransformSubset
-from utils import AverageMeter, str2bool
+from utils import AverageMeter, str2bool, SSIMLoss
 from torch.utils.tensorboard import SummaryWriter
 
 import shutil
@@ -66,7 +66,7 @@ def parse_args():
                         help='image width')
     parser.add_argument('--input_h', default=64, type=int,
                         help='image height')
-    parser.add_argument('--input_list', type=list_type, default=[64, 96, 128])
+    parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
 
     # loss
     parser.add_argument('--loss', default='MSELoss',
@@ -137,7 +137,7 @@ def parse_args():
     return config
 
 
-def train(config, train_loader, model, criterion, optimizer):
+def train(config, train_loader, model, criterion_mse, criterion_l1, criterion_ssim, optimizer):
     """训练一个epoch（回归任务）"""
     device = config['device']
     avg_meters = {
@@ -154,6 +154,14 @@ def train(config, train_loader, model, criterion, optimizer):
         input = input.to(device)
         target = target.to(device)
 
+        # 定义局部函数计算复合 Loss (MSE + L1 + SSIM)
+        def compute_composite_loss(pred, tgt):
+            l_mse = criterion_mse(pred, tgt)
+            l_l1 = criterion_l1(pred, tgt)
+            l_ssim = criterion_ssim(pred, tgt)
+            # 权重配方: 1.0*MSE + 0.1*L1 + 0.1*SSIM
+            return l_mse + 0.1 * l_l1 + 0.1 * l_ssim
+
         # Forward
         if config['deep_supervision']:
             outputs = model(input)
@@ -164,14 +172,20 @@ def train(config, train_loader, model, criterion, optimizer):
             loss = 0
             # 使用 zip 同时遍历输出和权重
             for output_item, weight in zip(outputs, weights):
-                loss += weight * criterion(output_item, target)
+                loss += weight * compute_composite_loss(output_item, target)
             # 取最后一个作为最终输出，用于计算后面的 MSE/MAE 指标
             output = outputs[-1]
         else:
             output = model(input)
-            loss = criterion(output, target)
+            loss = compute_composite_loss(output, target)
 
-        # 计算回归指标
+        # KAN 稀疏正则化
+        if not config['no_kan']:
+            reg_loss = model.get_regularization_loss()
+            lambda_reg = 0.001  # 建议调小一点，例如 0.001
+            loss = loss + lambda_reg * reg_loss
+
+        # 计算单纯的回归指标用于显示 (不含正则和SSIM权重)
         with torch.no_grad():
             mse = F.mse_loss(output, target)
             mae = F.l1_loss(output, target)
@@ -208,7 +222,7 @@ def train(config, train_loader, model, criterion, optimizer):
     }
 
 
-def validate(config, val_loader, model, criterion):
+def validate(config, val_loader, model, criterion_mse, criterion_l1, criterion_ssim):
     """验证（回归任务）"""
     device = config['device']
     avg_meters = {
@@ -226,17 +240,24 @@ def validate(config, val_loader, model, criterion):
             input = input.to(device)
             target = target.to(device)
 
+            # 定义局部函数计算复合 Loss
+            def compute_composite_loss(pred, tgt):
+                l_mse = criterion_mse(pred, tgt)
+                l_l1 = criterion_l1(pred, tgt)
+                l_ssim = criterion_ssim(pred, tgt)
+                return l_mse + 0.1 * l_l1 + 0.1 * l_ssim
+
             # Forward
             if config['deep_supervision']:
                 outputs = model(input)
                 weights = [0.4, 0.4, 1.0]
                 loss = 0
                 for output_item, weight in zip(outputs, weights):
-                    loss += weight * criterion(output_item, target)
+                    loss += weight * compute_composite_loss(output_item, target)
                 output = outputs[-1]
             else:
                 output = model(input)
-                loss = criterion(output, target)
+                loss = compute_composite_loss(output, target)
 
             # 计算回归指标
             mse = F.mse_loss(output, target)
@@ -330,18 +351,11 @@ def main():
     config['device'] = device
 
     # 损失函数（回归）
-    if config['loss'] == 'MSELoss':
-        criterion = nn.MSELoss().to(device)
-        print("✓ 使用MSE损失（回归任务）")
-    elif config['loss'] == 'L1Loss':
-        criterion = nn.L1Loss().to(device)
-        print("✓ 使用L1损失（回归任务）")
-    elif config['loss'] == 'SmoothL1Loss':
-        criterion = nn.SmoothL1Loss().to(device)
-        print("✓ 使用SmoothL1损失（回归任务）")
-    else:
-        criterion = nn.MSELoss().to(device)
-        print("⚠️  未指定损失函数，默认使用MSE")
+    print("✓ 初始化复合损失函数: MSE + L1 + SSIM")
+    criterion_mse = nn.MSELoss().to(device)
+    criterion_l1 = nn.L1Loss().to(device)
+    # channel 参数对应输出通道数 (实部+虚部=2)
+    criterion_ssim = SSIMLoss(window_size=11, channel=config['num_classes']).to(device)
 
     # 创建模型
     print("\n创建模型...")
@@ -558,10 +572,9 @@ def main():
         print('-' * 60)
 
         # Train
-        train_log = train(config, train_loader, model, criterion, optimizer)
-
-        # Validate
-        val_log = validate(config, val_loader, model, criterion)
+        train_log = train(config, train_loader, model, criterion_mse, criterion_l1, criterion_ssim, optimizer)
+        # val
+        val_log = validate(config, val_loader, model, criterion_mse, criterion_l1, criterion_ssim)
         # 如果当前的 MAE 比历史最好的还小，就更新历史最好
         if val_log['mae'] < best_mae: best_mae = val_log['mae']
         if val_log['mse'] < best_mse: best_mse = val_log['mse']
