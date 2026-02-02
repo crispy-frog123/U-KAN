@@ -87,3 +87,29 @@ class SSIMLoss(torch.nn.Module):
 
         # 我们要最小化 Loss，所以返回 1 - SSIM
         return 1 - ssim_val
+
+
+# [新增] 计算符合 DeepNIS 定义的 Relative Error (RMSE)
+def calc_relative_error(pred, target):
+    """
+    计算相对误差。
+    pred, target: 可以是 Tensor 或 Numpy array
+    """
+    import torch
+    import numpy as np
+
+    # 防止分母为 0
+    epsilon = 1e-8
+
+    # 如果是 Tensor (训练时用)
+    if torch.is_tensor(pred):
+        # norm 默认计算 Frobenius 范数 (即所有元素的平方和开根号)
+        numerator = torch.norm(pred - target)
+        denominator = torch.norm(target) + epsilon
+        return (numerator / denominator).item()
+
+    # 如果是 Numpy (测试时用)
+    else:
+        numerator = np.linalg.norm(pred - target)
+        denominator = np.linalg.norm(target) + epsilon
+        return numerator / denominator

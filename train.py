@@ -471,6 +471,7 @@ def main():
         Resize(config['input_h'], config['input_w']),
     ])
 
+
     # 创建完整数据集
     full_dataset = ComplexMatDataset(
         real_img_path=real_img_path,
@@ -499,6 +500,9 @@ def main():
     test_indices = indices[:test_split]  # 0~199
     val_indices = indices[test_split: test_split + val_split]  # 200~399
     train_indices = indices[test_split + val_split:]  # 400~1999
+
+    print(f"Computing normalization stats from {len(train_indices)} training samples...")
+    full_dataset.calculate_normalization_stats(train_indices)
 
     # train.py 只需要用到 train 和 val
     train_dataset = TransformSubset(full_dataset, train_indices, train_transform)

@@ -211,6 +211,29 @@ class ComplexMatDataset(Dataset):
 
         return img, mask, {'img_id': f'sample_{idx}'}
 
+    def denormalize(self, img_tensor):
+        """
+        将归一化后的 Tensor (C, H, W) 还原回原始物理数值
+        """
+        # 确保统计数据已加载 (如果是在 test.py 里，可能需要手动设或者从文件读)
+        # 临时方案：为了跑通，先假设你知道这些值。
+        # 在实际训练后，你应该把 mean/std 保存到了 config 或者 txt 里。
+        # 比如：
+        # real_mean = 1.05, real_std = 0.2
+        # imag_mean = 0.0, imag_std = 0.1
+
+        # 这里先写逻辑：
+        device = img_tensor.device
+        img_denorm = img_tensor.clone()
+
+        if self.normalize_method == 'z-score':
+            # 实部 (Channel 0)
+            img_denorm[0, :, :] = img_tensor[0, :, :] * self.real_std + self.real_mean
+            # 虚部 (Channel 1)
+            img_denorm[1, :, :] = img_tensor[1, :, :] * self.imag_std + self.imag_mean
+
+        return img_denorm
+
 
 class TransformSubset(torch.utils.data.Subset):
     """支持transform的Subset (无需修改)"""
