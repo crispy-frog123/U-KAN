@@ -406,16 +406,6 @@ class UKAN(nn.Module):
             self.head_p2 = nn.Conv2d(base_dim // 4, num_classes, kernel_size=1)
             self.head_p1 = nn.Conv2d(base_dim // 8, num_classes, kernel_size=1)
 
-    def get_regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
-        total_reg_loss = 0.
-        # 遍历模型中所有的子模块
-        for module in self.modules():
-            # 如果这个模块是 KANLinear 层
-            if isinstance(module, KANLinear):
-                # 累加它的正则化损失
-                total_reg_loss += module.regularization_loss(regularize_activation, regularize_entropy)
-        return total_reg_loss
-
     def forward(self, x):
         B = x.shape[0]
 

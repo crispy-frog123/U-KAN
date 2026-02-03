@@ -12,10 +12,10 @@ class ComplexMatDataset(Dataset):
     def __init__(self,
                  real_img_path,
                  imag_img_path,
-                 real_mask_path,
-                 imag_mask_path,
+                 real_label_path,
+                 imag_label_path,
                  img_var_name=None,
-                 mask_var_name=None,
+                 label_var_name=None,
                  img_size=(64, 64),
                  transform=None,
                  normalize_method='z-score'):
@@ -28,13 +28,13 @@ class ComplexMatDataset(Dataset):
         # ========== 变量名处理 ==========
         if img_var_name in [None, 'None', '']:
             img_var_name = None
-        if mask_var_name in [None, 'None', '']:
-            mask_var_name = None
+        if label_var_name in [None, 'None', '']:
+            label_var_name = None
 
         real_img_var = img_var_name
         imag_img_var = img_var_name
-        real_mask_var = mask_var_name
-        imag_mask_var = mask_var_name
+        real_label_var = label_var_name
+        imag_label_var = label_var_name
         # ===============================
 
         print("=" * 60)
@@ -48,29 +48,29 @@ class ComplexMatDataset(Dataset):
         print("[2/4] Loading Imaginary part images...")
         imag_img_data = self._load_mat(imag_img_path, imag_img_var)
 
-        print("[3/4] Loading Real part masks...")
-        real_mask_data = self._load_mat(real_mask_path, real_mask_var)
+        print("[3/4] Loading Real part labels...")
+        real_label_data = self._load_mat(real_label_path, real_label_var)
 
-        print("[4/4] Loading Imaginary part masks...")
-        imag_mask_data = self._load_mat(imag_mask_path, imag_mask_var)
+        print("[4/4] Loading Imaginary part labels...")
+        imag_label_data = self._load_mat(imag_label_path, imag_label_var)
 
         # Reshape数据
         print("\nReshaping data...")
         real_img = self._reshape_data(real_img_data)
         imag_img = self._reshape_data(imag_img_data)
-        real_mask = self._reshape_data(real_mask_data)
-        imag_mask = self._reshape_data(imag_mask_data)
+        real_label = self._reshape_data(real_label_data)
+        imag_label = self._reshape_data(imag_label_data)
 
         # 合并实部和虚部为2通道
         self.images = np.concatenate([real_img, imag_img], axis=-1)
-        self.masks = np.concatenate([real_mask, imag_mask], axis=-1)
+        self.labels = np.concatenate([real_label, imag_label], axis=-1)
 
         print(f"  Images combined: {self.images.shape}")
-        print(f"  Masks combined: {self.masks.shape}")
+        print(f"  labels combined: {self.labels.shape}")
 
         # 检查
-        assert self.images.shape[0] == self.masks.shape[0], \
-            f"Images and masks count mismatch!"
+        assert self.images.shape[0] == self.labels.shape[0], \
+            f"Images and labels count mismatch!"
 
         # ========== 修改点 1: 初始化归一化参数默认值 ==========
         # 不再自动计算，而是先给默认值（防止未调用计算方法时报错）
@@ -190,49 +190,26 @@ class ComplexMatDataset(Dataset):
     def __getitem__(self, idx):
         # 获取图片和掩码
         img = self.images[idx].copy()
-        mask = self.masks[idx].copy()
+        label = self.labels[idx].copy()
 
         # 应用归一化 (使用之前计算好的参数)
         img = self._normalize(img)
 
         # 数据增强
         if self.transform is not None:
-            augmented = self.transform(image=img, mask=mask)
+            augmented = self.transform(image=img, label=label)
             img = augmented['image']
-            mask = augmented['mask']
+            label = augmented['label']
 
         # 转置
         img = np.transpose(img, (2, 0, 1))
-        mask = np.transpose(mask, (2, 0, 1))
+        label = np.transpose(label, (2, 0, 1))
 
         # 转tensor
         img = torch.from_numpy(img)
-        mask = torch.from_numpy(mask)
+        label = torch.from_numpy(label)
 
-        return img, mask, {'img_id': f'sample_{idx}'}
-
-    def denormalize(self, img_tensor):
-        """
-        将归一化后的 Tensor (C, H, W) 还原回原始物理数值
-        """
-        # 确保统计数据已加载 (如果是在 test.py 里，可能需要手动设或者从文件读)
-        # 临时方案：为了跑通，先假设你知道这些值。
-        # 在实际训练后，你应该把 mean/std 保存到了 config 或者 txt 里。
-        # 比如：
-        # real_mean = 1.05, real_std = 0.2
-        # imag_mean = 0.0, imag_std = 0.1
-
-        # 这里先写逻辑：
-        device = img_tensor.device
-        img_denorm = img_tensor.clone()
-
-        if self.normalize_method == 'z-score':
-            # 实部 (Channel 0)
-            img_denorm[0, :, :] = img_tensor[0, :, :] * self.real_std + self.real_mean
-            # 虚部 (Channel 1)
-            img_denorm[1, :, :] = img_tensor[1, :, :] * self.imag_std + self.imag_mean
-
-        return img_denorm
+        return img, label, {'img_id': f'sample_{idx}'}
 
 
 class TransformSubset(torch.utils.data.Subset):
@@ -243,20 +220,20 @@ class TransformSubset(torch.utils.data.Subset):
         self.transform = transform
 
     def __getitem__(self, idx):
-        img, mask, meta = self.dataset[self.indices[idx]]
+        img, label, meta = self.dataset[self.indices[idx]]
 
         if self.transform is not None:
             # 转回numpy做增强
             img_np = img.numpy().transpose(1, 2, 0)
-            mask_np = mask.numpy().transpose(1, 2, 0)
+            label_np = label.numpy().transpose(1, 2, 0)
 
             # 数据增强
-            augmented = self.transform(image=img_np, mask=mask_np)
+            augmented = self.transform(image=img_np, label=label_np)
             img_np = augmented['image']
-            mask_np = augmented['mask']
+            label_np = augmented['label']
 
             # 转回tensor
             img = torch.from_numpy(img_np.transpose(2, 0, 1))
-            mask = torch.from_numpy(mask_np.transpose(2, 0, 1))
+            label = torch.from_numpy(label_np.transpose(2, 0, 1))
 
-        return img, mask, meta
+        return img, label, meta

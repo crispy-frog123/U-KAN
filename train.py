@@ -23,7 +23,7 @@ from albumentations import RandomRotate90, Resize
 
 import archs
 from dataset_e import ComplexMatDataset, TransformSubset
-from utils import AverageMeter, str2bool, SSIMLoss
+from utils import AverageMeter, str2bool
 from torch.utils.tensorboard import SummaryWriter
 
 import shutil
@@ -81,15 +81,15 @@ def parse_args():
                         help='real part image .mat file')
     parser.add_argument('--imag_img_file', default='input/chi0_all_imag_mnist.mat',
                         help='imaginary part image .mat file')
-    parser.add_argument('--real_mask_file', default='label/chi_all_real_mnist.mat',
-                        help='real part mask .mat file')
-    parser.add_argument('--imag_mask_file', default='label/chi_all_imag_mnist.mat',
-                        help='imaginary part mask .mat file')
+    parser.add_argument('--real_label_file', default='label/chi_all_real_mnist.mat',
+                        help='real part label .mat file')
+    parser.add_argument('--imag_label_file', default='label/chi_all_imag_mnist.mat',
+                        help='imaginary part label .mat file')
 
     parser.add_argument('--img_var_name', default='chi0_all_real',
                         help='variable name in .mat file for images')
-    parser.add_argument('--mask_var_name', default='chi_all_real',
-                        help='variable name in .mat file for masks')
+    parser.add_argument('--label_var_name', default='chi_all_real',
+                        help='variable name in .mat file for labels')
 
     parser.add_argument('--original_img_size', default=64, type=int,
                         help='original image size (H=W)')
@@ -137,7 +137,7 @@ def parse_args():
     return config
 
 
-def train(config, train_loader, model, criterion_mse, criterion_l1, criterion_ssim, optimizer):
+def train(config, train_loader, model, criterion, optimizer):
     """训练一个epoch（回归任务）"""
     device = config['device']
     avg_meters = {
@@ -154,14 +154,6 @@ def train(config, train_loader, model, criterion_mse, criterion_l1, criterion_ss
         input = input.to(device)
         target = target.to(device)
 
-        # 定义局部函数计算复合 Loss (MSE + L1 + SSIM)
-        def compute_composite_loss(pred, tgt):
-            l_mse = criterion_mse(pred, tgt)
-            l_l1 = criterion_l1(pred, tgt)
-            l_ssim = criterion_ssim(pred, tgt)
-            # 权重配方: 1.0*MSE + 0.1*L1 + 0.1*SSIM
-            return l_mse + 0.1 * l_l1 + 0.1 * l_ssim
-
         # Forward
         if config['deep_supervision']:
             outputs = model(input)
@@ -172,20 +164,14 @@ def train(config, train_loader, model, criterion_mse, criterion_l1, criterion_ss
             loss = 0
             # 使用 zip 同时遍历输出和权重
             for output_item, weight in zip(outputs, weights):
-                loss += weight * compute_composite_loss(output_item, target)
+                loss += weight * criterion(output_item, target)
             # 取最后一个作为最终输出，用于计算后面的 MSE/MAE 指标
             output = outputs[-1]
         else:
             output = model(input)
-            loss = compute_composite_loss(output, target)
+            loss = criterion(output, target)
 
-        # KAN 稀疏正则化
-        if not config['no_kan']:
-            reg_loss = model.get_regularization_loss()
-            lambda_reg = 0.001  # 建议调小一点，例如 0.001
-            loss = loss + lambda_reg * reg_loss
-
-        # 计算单纯的回归指标用于显示 (不含正则和SSIM权重)
+        # 计算回归指标
         with torch.no_grad():
             mse = F.mse_loss(output, target)
             mae = F.l1_loss(output, target)
@@ -222,7 +208,7 @@ def train(config, train_loader, model, criterion_mse, criterion_l1, criterion_ss
     }
 
 
-def validate(config, val_loader, model, criterion_mse, criterion_l1, criterion_ssim):
+def validate(config, val_loader, model, criterion):
     """验证（回归任务）"""
     device = config['device']
     avg_meters = {
@@ -240,24 +226,17 @@ def validate(config, val_loader, model, criterion_mse, criterion_l1, criterion_s
             input = input.to(device)
             target = target.to(device)
 
-            # 定义局部函数计算复合 Loss
-            def compute_composite_loss(pred, tgt):
-                l_mse = criterion_mse(pred, tgt)
-                l_l1 = criterion_l1(pred, tgt)
-                l_ssim = criterion_ssim(pred, tgt)
-                return l_mse + 0.1 * l_l1 + 0.1 * l_ssim
-
             # Forward
             if config['deep_supervision']:
                 outputs = model(input)
                 weights = [0.4, 0.4, 1.0]
                 loss = 0
                 for output_item, weight in zip(outputs, weights):
-                    loss += weight * compute_composite_loss(output_item, target)
+                    loss += weight * criterion(output_item, target)
                 output = outputs[-1]
             else:
                 output = model(input)
-                loss = compute_composite_loss(output, target)
+                loss = criterion(output, target)
 
             # 计算回归指标
             mse = F.mse_loss(output, target)
@@ -351,11 +330,18 @@ def main():
     config['device'] = device
 
     # 损失函数（回归）
-    print("✓ 初始化复合损失函数: MSE + L1 + SSIM")
-    criterion_mse = nn.MSELoss().to(device)
-    criterion_l1 = nn.L1Loss().to(device)
-    # channel 参数对应输出通道数 (实部+虚部=2)
-    criterion_ssim = SSIMLoss(window_size=11, channel=config['num_classes']).to(device)
+    if config['loss'] == 'MSELoss':
+        criterion = nn.MSELoss().to(device)
+        print("✓ 使用MSE损失（回归任务）")
+    elif config['loss'] == 'L1Loss':
+        criterion = nn.L1Loss().to(device)
+        print("✓ 使用L1损失（回归任务）")
+    elif config['loss'] == 'SmoothL1Loss':
+        criterion = nn.SmoothL1Loss().to(device)
+        print("✓ 使用SmoothL1损失（回归任务）")
+    else:
+        criterion = nn.MSELoss().to(device)
+        print("⚠️  未指定损失函数，默认使用MSE")
 
     # 创建模型
     print("\n创建模型...")
@@ -450,14 +436,14 @@ def main():
 
     real_img_path = build_path(config['data_dir'], config['real_img_file'])
     imag_img_path = build_path(config['data_dir'], config['imag_img_file'])
-    real_mask_path = build_path(config['data_dir'], config['real_mask_file'])
-    imag_mask_path = build_path(config['data_dir'], config['imag_mask_file'])
+    real_label_path = build_path(config['data_dir'], config['real_label_file'])
+    imag_label_path = build_path(config['data_dir'], config['imag_label_file'])
 
     print(f"\nData files:")
     print(f"  Real image:  {real_img_path}")
     print(f"  Imag image:  {imag_img_path}")
-    print(f"  Real target: {real_mask_path}")
-    print(f"  Imag target: {imag_mask_path}")
+    print(f"  Real target: {real_label_path}")
+    print(f"  Imag target: {imag_label_path}")
 
     # 数据增强
     train_transform = Compose([
@@ -471,13 +457,12 @@ def main():
         Resize(config['input_h'], config['input_w']),
     ])
 
-
     # 创建完整数据集
     full_dataset = ComplexMatDataset(
         real_img_path=real_img_path,
         imag_img_path=imag_img_path,
-        real_mask_path=real_mask_path,
-        imag_mask_path=imag_mask_path,
+        real_label_path=real_label_path,
+        imag_label_path=imag_label_path,
         img_size=(config['original_img_size'], config['original_img_size']),
         transform=None,
         normalize_method='z-score'
@@ -490,19 +475,18 @@ def main():
     np.random.seed(config['dataseed'])
     np.random.shuffle(indices)
 
-    # Test:  0   - 199   (10%) -> 留给 test.py 用，
+    # 假设 dataset_size = 2000
+    # Test:  0   - 199   (10%) -> 留给 test.py 用，train.py 绝对不能碰！
     # Val:   200 - 399   (10%) -> 用于验证
     # Train: 400 - 1999  (80%) -> 用于训练
 
     test_split = int(np.floor(0.1 * dataset_size))  # 10%
     val_split = int(np.floor(0.1 * dataset_size))  # 10%
 
+    # 这里的切片逻辑非常关键：
     test_indices = indices[:test_split]  # 0~199
     val_indices = indices[test_split: test_split + val_split]  # 200~399
     train_indices = indices[test_split + val_split:]  # 400~1999
-
-    print(f"Computing normalization stats from {len(train_indices)} training samples...")
-    full_dataset.calculate_normalization_stats(train_indices)
 
     # train.py 只需要用到 train 和 val
     train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
@@ -576,9 +560,10 @@ def main():
         print('-' * 60)
 
         # Train
-        train_log = train(config, train_loader, model, criterion_mse, criterion_l1, criterion_ssim, optimizer)
-        # val
-        val_log = validate(config, val_loader, model, criterion_mse, criterion_l1, criterion_ssim)
+        train_log = train(config, train_loader, model, criterion, optimizer)
+
+        # Validate
+        val_log = validate(config, val_loader, model, criterion)
         # 如果当前的 MAE 比历史最好的还小，就更新历史最好
         if val_log['mae'] < best_mae: best_mae = val_log['mae']
         if val_log['mse'] < best_mse: best_mse = val_log['mse']
