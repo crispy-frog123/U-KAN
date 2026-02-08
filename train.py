@@ -23,7 +23,8 @@ from albumentations import RandomRotate90, Resize
 
 import archs
 from dataset_e import ComplexMatDataset, TransformSubset
-from utils import AverageMeter, str2bool
+# [修改1] 确保导入 SSIMLoss
+from utils import AverageMeter, str2bool, SSIMLoss
 from torch.utils.tensorboard import SummaryWriter
 
 import shutil
@@ -68,16 +69,14 @@ def parse_args():
                         help='image height')
     parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
 
-    # loss
+    # loss [提示] 这里可以直接传 MSELoss 或 MSE_SSIM
     parser.add_argument('--loss', default='MSELoss',
-                        help='loss function for regression')
+                        help='loss function: MSELoss | MSE_SSIM')
 
     # 复数数据集路径
     parser.add_argument('--data_dir', default='inputs', help='dataset base directory')
 
-    parser.add_argument('--real_img_file', default='input\chi0_all_real_mnist.mat'
-                                                   ''
-                                                   '',
+    parser.add_argument('--real_img_file', default='input/chi0_all_real_mnist.mat',
                         help='real part image .mat file')
     parser.add_argument('--imag_img_file', default='input/chi0_all_imag_mnist.mat',
                         help='imaginary part image .mat file')
@@ -136,6 +135,17 @@ def parse_args():
 
     return config
 
+# [修改2] 定义 MSE + SSIM 组合损失类
+class MSE_SSIM_Loss(nn.Module):
+    def __init__(self, channel=2):
+        super(MSE_SSIM_Loss, self).__init__()
+        self.mse = nn.MSELoss()
+        self.ssim_loss = SSIMLoss(window_size=11, channel=channel)
+
+    def forward(self, pred, target):
+        # 1.0 * MSE + 0.1 * SSIM (经验配方)
+        return self.mse(pred, target) + 0.5 * self.ssim_loss(pred, target)
+
 
 def train(config, train_loader, model, criterion, optimizer):
     """训练一个epoch（回归任务）"""
@@ -158,14 +168,10 @@ def train(config, train_loader, model, criterion, optimizer):
         if config['deep_supervision']:
             outputs = model(input)
             # Deep Supervision 加权 Loss
-            # outputs 顺序: [p2, p1, final]
-            # 权重策略: 辅助头 0.4, 主头 1.0
             weights = [0.4, 0.4, 1.0]
             loss = 0
-            # 使用 zip 同时遍历输出和权重
             for output_item, weight in zip(outputs, weights):
                 loss += weight * criterion(output_item, target)
-            # 取最后一个作为最终输出，用于计算后面的 MSE/MAE 指标
             output = outputs[-1]
         else:
             output = model(input)
@@ -289,10 +295,10 @@ def main():
 
     # 自动生成实验名
     if config['name'] is None:
-        if config['deep_supervision']:
-            config['name'] = 'test3_%s_wDS' % config['arch']
+        if config['loss'] == 'MSE_SSIM':
+            config['name'] = 'test3_%s_wDS_Combo' % config['arch']
         else:
-            config['name'] = 'test3_%s_woDS' % config['arch']
+            config['name'] = 'test3_%s_wDS_%s' % (config['arch'], config['loss'])
         exp_name = config['name']
 
     os.makedirs(f'{output_dir}/{exp_name}', exist_ok=True)
@@ -329,19 +335,23 @@ def main():
 
     config['device'] = device
 
-    # 损失函数（回归）
+    # [修改3] 损失函数选择逻辑
     if config['loss'] == 'MSELoss':
         criterion = nn.MSELoss().to(device)
-        print("✓ 使用MSE损失（回归任务）")
+        print("✓ 使用 MSE 损失 (DeepNIS Baseline)")
+    elif config['loss'] == 'MSE_SSIM':
+        criterion = MSE_SSIM_Loss(channel=config['num_classes']).to(device)
+        print("✓ 使用 MSE + SSIM 组合损失 (Proposed)")
     elif config['loss'] == 'L1Loss':
         criterion = nn.L1Loss().to(device)
-        print("✓ 使用L1损失（回归任务）")
+        print("✓ 使用 L1 损失")
     elif config['loss'] == 'SmoothL1Loss':
         criterion = nn.SmoothL1Loss().to(device)
-        print("✓ 使用SmoothL1损失（回归任务）")
+        print("✓ 使用 SmoothL1 损失")
     else:
+        # 默认回退到 MSE
         criterion = nn.MSELoss().to(device)
-        print("⚠️  未指定损失函数，默认使用MSE")
+        print(f"⚠️ 未识别的 Loss: {config['loss']}，默认使用 MSE")
 
     # 创建模型
     print("\n创建模型...")
@@ -488,6 +498,9 @@ def main():
     val_indices = indices[test_split: test_split + val_split]  # 200~399
     train_indices = indices[test_split + val_split:]  # 400~1999
 
+    print("\n[Auto-Fix] Calculating normalization stats using Training indices...")
+    full_dataset.calculate_normalization_stats(train_indices)
+
     # train.py 只需要用到 train 和 val
     train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
     val_dataset = TransformSubset(full_dataset, val_indices, val_transform)
@@ -497,16 +510,6 @@ def main():
     print(f"  Training:   {len(train_dataset)} (用于训练)")
     print(f"  Validation: {len(val_dataset)} (用于早停)")
     print(f"  Test:       {len(test_indices)} (保留给 test.py)")
-
-    # 创建Subset
-    train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
-    val_dataset = TransformSubset(full_dataset, val_indices, val_transform)
-
-    print(f"\nDataset split:")
-    print(f"  Total:      {dataset_size} samples")
-    print(f"  Training:   {len(train_dataset)} samples")
-    print(f"  Validation: {len(val_dataset)} samples")
-    print("=" * 60 + "\n")
 
     # DataLoaders
     train_loader = torch.utils.data.DataLoader(
@@ -549,7 +552,6 @@ def main():
     print("开始训练（回归任务）")
     print("=" * 60 + "\n")
 
-    # 因为是误差，所以初始值设为无穷大 (float('inf'))，越小越好
     best_loss = float('inf')
     best_mae = float('inf')
     best_mse = float('inf')
