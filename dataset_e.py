@@ -1,239 +1,203 @@
+import os
+import json
 import torch
 import numpy as np
+import scipy.io as sio
 import h5py
 from torch.utils.data import Dataset
 
 
 class ComplexMatDataset(Dataset):
-    """
-    读取复数数据（实部+虚部）的.mat文件，合并为2通道
-    """
-
-    def __init__(self,
-                 real_img_path,
-                 imag_img_path,
-                 real_label_path,
-                 imag_label_path,
-                 img_var_name=None,
-                 label_var_name=None,
-                 img_size=(64, 64),
-                 transform=None,
-                 normalize_method='z-score'):
-
+    def __init__(self, real_img_path, imag_img_path, real_label_path, imag_label_path,
+                 img_size=(64, 64), transform=None, normalize_method='z-score'):
+        """
+        Modified Dataset for DeepNIS:
+        1. Input (chi0): Uses Z-Score Normalization.
+        2. Label (chi):  USES NO NORMALIZATION (Raw values [-2, 0]).
+        """
         self.transform = transform
-        self.img_size = img_size
-        self.H, self.W = img_size
         self.normalize_method = normalize_method
 
-        # ========== 变量名处理 ==========
-        if img_var_name in [None, 'None', '']:
-            img_var_name = None
-        if label_var_name in [None, 'None', '']:
-            label_var_name = None
+        # 1. Load Data
+        self.real_img = self._load_mat(real_img_path)
+        self.imag_img = self._load_mat(imag_img_path)
+        self.real_label = self._load_mat(real_label_path)
+        self.imag_label = self._load_mat(imag_label_path)
 
-        real_img_var = img_var_name
-        imag_img_var = img_var_name
-        real_label_var = label_var_name
-        imag_label_var = label_var_name
-        # ===============================
+        # Ensure correct shape (N, H, W) or (H, W, N) -> (N, H, W)
+        self.real_img = self._check_dims(self.real_img)
+        self.imag_img = self._check_dims(self.imag_img)
+        self.real_label = self._check_dims(self.real_label)
+        self.imag_label = self._check_dims(self.imag_label)
 
-        print("=" * 60)
-        print("Loading Complex Data (Real + Imaginary)")
-        print("=" * 60)
+        self.img_size = img_size
 
-        # 加载数据
-        print("[1/4] Loading Real part images...")
-        real_img_data = self._load_mat(real_img_path, real_img_var)
+        # 2. Initialize Normalization Stats (Default to Identity/No-op)
+        # Input Stats (will be updated by calculate_normalization_stats)
+        self.inp_real_mean = 0.0
+        self.inp_real_std = 1.0
+        self.inp_imag_mean = 0.0
+        self.inp_imag_std = 1.0
 
-        print("[2/4] Loading Imaginary part images...")
-        imag_img_data = self._load_mat(imag_img_path, imag_img_var)
+        # Label Stats (Not used for normalization, but kept for reference)
+        self.lbl_real_max = 1.0
+        self.lbl_real_min = 0.0
 
-        print("[3/4] Loading Real part labels...")
-        real_label_data = self._load_mat(real_label_path, real_label_var)
+        self.stats_calculated = False
 
-        print("[4/4] Loading Imaginary part labels...")
-        imag_label_data = self._load_mat(imag_label_path, imag_label_var)
-
-        # Reshape数据
-        print("\nReshaping data...")
-        real_img = self._reshape_data(real_img_data)
-        imag_img = self._reshape_data(imag_img_data)
-        real_label = self._reshape_data(real_label_data)
-        imag_label = self._reshape_data(imag_label_data)
-
-        # 合并实部和虚部为2通道
-        self.images = np.concatenate([real_img, imag_img], axis=-1)
-        self.labels = np.concatenate([real_label, imag_label], axis=-1)
-
-        print(f"  Images combined: {self.images.shape}")
-        print(f"  labels combined: {self.labels.shape}")
-
-        # 检查
-        assert self.images.shape[0] == self.labels.shape[0], \
-            f"Images and labels count mismatch!"
-
-        # ========== 修改点 1: 初始化归一化参数默认值 ==========
-        # 不再自动计算，而是先给默认值（防止未调用计算方法时报错）
-        self.real_mean, self.real_std = 0.0, 1.0
-        self.imag_mean, self.imag_std = 0.0, 1.0
-        self.real_min, self.real_max = 0.0, 1.0
-        self.imag_min, self.imag_max = 0.0, 1.0
-
-        self.stats_calculated = False  # 标记位
-        # ====================================================
-
-        # 统计信息
-        print("\n" + "=" * 60)
-        print("Dataset loaded successfully!")
-        print("=" * 60)
-        print(f"  Total samples: {len(self)}")
-        print(f"  Image shape per sample: {self.images.shape[1:]}")
-        print(f"  Channels: 2 (Real + Imaginary)")
-        print(f"  Normalize method: {self.normalize_method}")
-        print(
-            "  (Note: Normalization stats not calculated yet. Call 'calculate_normalization_stats' with training indices.)")
-        print("=" * 60 + "\n")
-
-    def _load_mat(self, mat_path, var_name):
-        """加载.mat文件，支持自动推断变量名"""
+    def _load_mat(self, path):
         try:
-            import scipy.io as sio
-            data = sio.loadmat(mat_path)
-            if var_name is None:
-                available_vars = [k for k in data.keys() if not k.startswith('__')]
-                if not available_vars:
-                    raise ValueError(f"No valid variables in {mat_path}")
-                var_name = available_vars[0]
-            return data[var_name]
-        except:
-            with h5py.File(mat_path, 'r') as f:
-                if var_name is None:
-                    available_vars = list(f.keys())
-                    if not available_vars:
-                        raise ValueError(f"No valid variables in {mat_path}")
-                    var_name = available_vars[0]
-                data = f[var_name][:]
-                if data.shape[0] != self.H * self.W:
-                    data = data.T
-                return data
+            data = sio.loadmat(path)
+            keys = [k for k in data.keys() if not k.startswith('__')]
+            return data[keys[0]]
+        except NotImplementedError:
+            with h5py.File(path, 'r') as f:
+                keys = list(f.keys())
+                return f[keys[0]][:]
 
-    def _reshape_data(self, data):
-        """将展平的数据reshape回图片"""
-        N = data.shape[0]
-        if data.shape[1] != self.H * self.W:
-            data = data.T
-            N = data.shape[0]
-        assert data.shape[1] == self.H * self.W, \
-            f"Expected {self.H * self.W} pixels per image, got {data.shape[1]}"
-        data = data.reshape(N, self.H, self.W)
-        data = np.expand_dims(data, axis=-1)
-        return data.astype('float32')
+    def _check_dims(self, data):
+        # Assuming data is (H*W, N) or (N, H*W) or similar flat structure based on previous context
+        # Adjust this if your raw .mat is already (N, 64, 64)
+        if data.ndim == 2:
+            # Heuristic: usually N is 2000 or 4000, 4096 is 64*64
+            if data.shape[0] == 4096:
+                # (4096, N) -> (N, 64, 64)
+                N = data.shape[1]
+                data = data.T.reshape(N, 64, 64)
+            elif data.shape[1] == 4096:
+                # (N, 4096) -> (N, 64, 64)
+                N = data.shape[0]
+                data = data.reshape(N, 64, 64)
+        return data
 
-    # ========== 修改点 2: 将私有方法改为公开方法，并支持 indices 参数 ==========
-    def calculate_normalization_stats(self, indices=None):
+    def calculate_normalization_stats(self, indices):
         """
-        计算归一化参数。
-        为了避免数据泄露，应该只传入训练集的 indices。
+        Calculate stats ONLY for Inputs using training indices.
+        Labels are intentionally NOT normalized to preserve sparsity (0 background).
         """
-        if self.normalize_method == 'none':
-            return
+        print(f"Computing Input normalization stats on {len(indices)} training samples...")
 
-        # 根据 indices 选择数据子集
-        if indices is None:
-            subset_images = self.images
-            print("Warning: Calculating normalization stats on ALL data (Validation data leakage risk!)")
-        else:
-            subset_images = self.images[indices]
-            print(f"Calculating normalization stats based on {len(indices)} training samples...")
+        # Select training subset
+        train_real = self.real_img[indices]
+        train_imag = self.imag_img[indices]
 
-        if self.normalize_method == 'z-score':
-            # 分通道计算
-            self.real_mean = subset_images[:, :, :, 0].mean()
-            self.real_std = subset_images[:, :, :, 0].std()
-            self.imag_mean = subset_images[:, :, :, 1].mean()
-            self.imag_std = subset_images[:, :, :, 1].std()
+        # Calculate Z-Score params for INPUT
+        self.inp_real_mean = float(np.mean(train_real))
+        self.inp_real_std = float(np.std(train_real)) + 1e-8  # avoid div by zero
 
-            print(f"\n[Stats Updated] Z-Score Parameters:")
-            print(f"  Real channel - mean: {self.real_mean:.4f}, std: {self.real_std:.4f}")
-            print(f"  Imag channel - mean: {self.imag_mean:.4f}, std: {self.imag_std:.4f}")
-
-        elif self.normalize_method == 'min-max':
-            self.real_min = subset_images[:, :, :, 0].min()
-            self.real_max = subset_images[:, :, :, 0].max()
-            self.imag_min = subset_images[:, :, :, 1].min()
-            self.imag_max = subset_images[:, :, :, 1].max()
-
-            print(f"\n[Stats Updated] Min-Max Parameters:")
-            print(f"  Real channel - min: {self.real_min:.4f}, max: {self.real_max:.4f}")
-            print(f"  Imag channel - min: {self.imag_min:.4f}, max: {self.imag_max:.4f}")
+        self.inp_imag_mean = float(np.mean(train_imag))
+        self.inp_imag_std = float(np.std(train_imag)) + 1e-8
 
         self.stats_calculated = True
+        print(f"  [Input Real] Mean: {self.inp_real_mean:.4f}, Std: {self.inp_real_std:.4f}")
+        print(f"  [Input Imag] Mean: {self.inp_imag_mean:.4f}, Std: {self.inp_imag_std:.4f}")
+        print(f"  [Label] skipped (keeping raw values for physics consistency).")
 
-    def _normalize(self, img):
-        """对图像进行归一化"""
-        # 防止分母为0
-        epsilon = 1e-8
+    def save_stats(self, save_path):
+        """Save input stats to JSON for consistency in Testing."""
+        stats = {
+            'inp_real_mean': self.inp_real_mean,
+            'inp_real_std': self.inp_real_std,
+            'inp_imag_mean': self.inp_imag_mean,
+            'inp_imag_std': self.inp_imag_std,
+            'method': self.normalize_method
+        }
+        with open(save_path, 'w') as f:
+            json.dump(stats, f, indent=4)
+        print(f"Normalization stats saved to {save_path}")
 
-        if self.normalize_method == 'z-score':
-            img[:, :, 0] = (img[:, :, 0] - self.real_mean) / (self.real_std + epsilon)
-            img[:, :, 1] = (img[:, :, 1] - self.imag_mean) / (self.imag_std + epsilon)
+    def load_stats(self, load_path):
+        """Load input stats from JSON."""
+        if not os.path.exists(load_path):
+            print(f"Warning: Stats file {load_path} not found! Using Identity norm.")
+            return
 
-        elif self.normalize_method == 'min-max':
-            img[:, :, 0] = (img[:, :, 0] - self.real_min) / (self.real_max - self.real_min + epsilon)
-            img[:, :, 1] = (img[:, :, 1] - self.imag_min) / (self.imag_max - self.imag_min + epsilon)
+        with open(load_path, 'r') as f:
+            stats = json.load(f)
 
-        return img
+        self.inp_real_mean = stats['inp_real_mean']
+        self.inp_real_std = stats['inp_real_std']
+        self.inp_imag_mean = stats['inp_imag_mean']
+        self.inp_imag_std = stats['inp_imag_std']
+        self.stats_calculated = True
+        print(f"Normalization stats loaded from {load_path}")
 
     def __len__(self):
-        return self.images.shape[0]
+        return self.real_img.shape[0]
 
     def __getitem__(self, idx):
-        # 获取图片和掩码
-        img = self.images[idx].copy()
-        label = self.labels[idx].copy()
+        # 1. Get Data
+        input_r = self.real_img[idx]
+        input_i = self.imag_img[idx]
+        label_r = self.real_label[idx]
+        label_i = self.imag_label[idx]
 
-        # 应用归一化 (使用之前计算好的参数)
-        img = self._normalize(img)
+        # 2. Normalize INPUT ONLY (Z-Score)
+        # (input - mean) / std
+        input_r = (input_r - self.inp_real_mean) / self.inp_real_std
+        input_i = (input_i - self.inp_imag_mean) / self.inp_imag_std
 
-        # 数据增强
-        if self.transform is not None:
-            augmented = self.transform(image=img, label=label)
-            img = augmented['image']
-            label = augmented['label']
+        # 3. Handle LABEL (Do NOT normalize)
+        # Keep them as raw float values.
+        # If you want to scale them slightly (e.g. /2.0), do it here, but raw is fine.
 
-        # 转置
-        img = np.transpose(img, (2, 0, 1))
-        label = np.transpose(label, (2, 0, 1))
+        # 4. To Tensor (C, H, W)
+        input_tensor = torch.stack([
+            torch.from_numpy(input_r).float(),
+            torch.from_numpy(input_i).float()
+        ], dim=0)
 
-        # 转tensor
-        img = torch.from_numpy(img)
-        label = torch.from_numpy(label)
+        label_tensor = torch.stack([
+            torch.from_numpy(label_r).float(),
+            torch.from_numpy(label_i).float()
+        ], dim=0)
 
-        return img, label, {'img_id': f'sample_{idx}'}
+        # 5. Apply Transforms (if any, usually Resize)
+        # Note: Transform logic usually expects HWC or CHW.
+        # Since we manually stacked CHW, make sure transform handles it or apply before stack.
+        # Assuming transform is just Resize which works on Tensor or PIL.
+        # If your transform is complex (albumentations), it needs numpy HWC.
+        # Keeping it simple for now based on your code:
+        if self.transform:
+            # Naive transform application (assuming simple torch transforms)
+            # If using Albumentations, strict adaptation is needed.
+            # Here we return tensor directly as your code seemed to handle transforms externally or minimally.
+            pass
+
+        return input_tensor, label_tensor, idx
 
 
-class TransformSubset(torch.utils.data.Subset):
-    """支持transform的Subset (无需修改)"""
+class TransformSubset(Dataset):
+    """
+    Subset wrapper to apply transforms dynamically
+    """
 
     def __init__(self, dataset, indices, transform=None):
-        super().__init__(dataset, indices)
+        self.dataset = dataset
+        self.indices = indices
         self.transform = transform
 
     def __getitem__(self, idx):
-        img, label, meta = self.dataset[self.indices[idx]]
+        real_idx = self.indices[idx]
+        input_tensor, label_tensor, _ = self.dataset[real_idx]
 
-        if self.transform is not None:
-            # 转回numpy做增强
-            img_np = img.numpy().transpose(1, 2, 0)
-            label_np = label.numpy().transpose(1, 2, 0)
+        # Apply Albumentations or Resize here if needed
+        # Convert to numpy HWC for Albumentations
+        if self.transform:
+            input_np = input_tensor.permute(1, 2, 0).numpy()  # (H, W, C)
+            label_np = label_tensor.permute(1, 2, 0).numpy()
 
-            # 数据增强
-            augmented = self.transform(image=img_np, label=label_np)
-            img_np = augmented['image']
-            label_np = augmented['label']
+            # Apply same transform to input and label? usually inputs only for aug,
+            # but resize must be both.
+            # Assuming 'transform' is just Resize for now based on context.
+            augmented = self.transform(image=input_np, mask=label_np)
+            input_np = augmented['image']
+            label_np = augmented['mask']
 
-            # 转回tensor
-            img = torch.from_numpy(img_np.transpose(2, 0, 1))
-            label = torch.from_numpy(label_np.transpose(2, 0, 1))
+            input_tensor = torch.from_numpy(input_np).permute(2, 0, 1).float()
+            label_tensor = torch.from_numpy(label_np).permute(2, 0, 1).float()
 
-        return img, label, meta
+        return input_tensor, label_tensor, real_idx
+
+    def __len__(self):
+        return len(self.indices)

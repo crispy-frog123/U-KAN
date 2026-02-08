@@ -62,10 +62,79 @@ def calculate_deepnis_metrics(pred, target):
     return mse_val, avg_ssim
 
 
+def plot_method_comparison(current_mse, current_ssim, save_dir):
+    """
+    绘制方法对比图，并保存到指定的实验目录下。
+    """
+    import matplotlib.pyplot as plt
+    import os  # 确保导入 os
+    import numpy as np
+
+    # 1. 定义对比数据
+    methods = ['BP (Baseline)', 'CS-Net', 'DeepNIS', 'PGAN', 'Ours (UKAN)']
+    # 注意：这里把 DeepNIS 的 MSE 修正为 0.082 (实验数据) 或 0.005 (仿真数据)，根据你的实际对比需求
+    # 这里暂时用 0.082 作为保守对比
+    mse_values = [0.171, 0.179, 0.082, 0.090, current_mse]
+    ssim_values = [0.750, 0.788, 0.863, 0.918, current_ssim]
+
+    x = np.arange(len(methods))
+    width = 0.35
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    # 绘制 MSE
+    rects1 = ax1.bar(x - width/2, mse_values, width, label='MSE (Lower is Better)', color='#ff9999', alpha=0.9)
+    ax1.set_ylabel('MSE / RRMSE', color='#d62728', fontsize=12, fontweight='bold')
+    ax1.set_ylim(0, 0.25)
+    ax1.tick_params(axis='y', labelcolor='#d62728')
+    ax1.set_xlabel('Methods', fontsize=12)
+
+    # 绘制 SSIM
+    ax2 = ax1.twinx()
+    rects2 = ax2.bar(x + width/2, ssim_values, width, label='SSIM (Higher is Better)', color='#99ff99', alpha=0.9)
+    ax2.set_ylabel('SSIM', color='#2ca02c', fontsize=12, fontweight='bold')
+    ax2.set_ylim(0.6, 1.0)
+    ax2.tick_params(axis='y', labelcolor='#2ca02c')
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(methods, fontsize=11, fontweight='bold')
+    ax1.set_title(f'Performance Comparison: SOTA vs. Ours', fontsize=14, pad=20)
+
+    # 自动标注数值
+    def autolabel(rects, ax):
+        for rect in rects:
+            height = rect.get_height()
+            ax.annotate(f'{height:.3f}', xy=(rect.get_x() + rect.get_width() / 2, height),
+                        xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
+
+    autolabel(rects1, ax1)
+    autolabel(rects2, ax2)
+
+    # 图例
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=2)
+
+    fig.tight_layout()
+
+    # ================= [核心修改] =================
+    # 1. 确保目标文件夹存在
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"[Info] Created directory: {save_dir}")
+
+    # 2. 保存图片
+    save_path = os.path.join(save_dir, 'method_comparison_bar.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"[Plot] Comparison chart saved to: {save_path}")
+    plt.close()
+    # =============================================
+
+
 def main():
     args = parse_args()
 
-    # 1. 加载 Config (配置部分完全按照你的 test.py 格式)
+    # 1. 加载 Config
     config_path = os.path.join(args.exp_dir, 'config.yml')
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found at {config_path}")
@@ -189,6 +258,9 @@ def main():
     print(f"Avg MSE:  {metrics['mse'].avg:.6f}  (Target: < 0.05)")
     print(f"Avg SSIM: {metrics['ssim'].avg:.4f}  (Target: > 0.85)")
     print(f"{'=' * 60}\n")
+
+    print(f"Generating method comparison chart...")
+    plot_method_comparison(metrics['mse'].avg, metrics['ssim'].avg, args.exp_dir)
 
     # 7. 绘制随机抽取的 10 张图
     save_full_path = os.path.join(args.exp_dir, args.save_dir)

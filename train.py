@@ -500,6 +500,7 @@ def main():
 
     print("\n[Auto-Fix] Calculating normalization stats using Training indices...")
     full_dataset.calculate_normalization_stats(train_indices)
+    full_dataset.save_stats(os.path.join(output_dir, exp_name, 'norm_stats.json'))
 
     # train.py 只需要用到 train 和 val
     train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
