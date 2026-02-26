@@ -493,3 +493,4 @@ class UKAN(nn.Module):
             return [out_p2, out_p1, final_out]  # 权重建议: [0.4, 0.4, 1.0]
 
         return final_out
+
