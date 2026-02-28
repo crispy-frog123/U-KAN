@@ -4,6 +4,7 @@ os.environ['KMP_DUPLICATE_LIB_OK']='True'
 from collections import OrderedDict
 from glob import glob
 import random
+import copy
 import numpy as np
 
 import pandas as pd
@@ -70,7 +71,7 @@ def parse_args():
     parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
 
     # loss [提示] 这里可以直接传 MSELoss 或 MSE_SSIM
-    parser.add_argument('--loss', default='MSELoss',
+    parser.add_argument('--loss', default='MSE_SSIM',
                         help='loss function: MSELoss | MSE_SSIM')
 
     # 复数数据集路径
@@ -127,9 +128,29 @@ def parse_args():
     parser.add_argument('--gamma', default=2 / 3, type=float)
     parser.add_argument('--early_stopping', default=60, type=int,
                         metavar='N', help='early stopping (default: 60)')
+    parser.add_argument('--early_stop_metric', default='mse', choices=['loss', 'mse', 'mae', 'rmse'],
+                        help='metric used by early stopping and main checkpoint trigger')
 
     parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--no_kan', action='store_true')
+    parser.add_argument('--blank_strategy', default='filter',
+                        choices=['none', 'filter', 'downweight'])
+    parser.add_argument('--blank_list_file', default='data_quality_report/blank_list.txt')
+    parser.add_argument('--blank_weight', default=0.2, type=float)
+    parser.add_argument('--fg_alpha', default=0.3, type=float)
+    parser.add_argument('--fg_tau', default=0.03, type=float)
+    parser.add_argument('--stage2_start_epoch', default=80, type=int)
+    parser.add_argument('--use_ema', default=True, type=str2bool)
+    parser.add_argument('--ema_decay', default=0.999, type=float)
+    parser.add_argument('--ssim_w_start', default=0.05, type=float,
+                        help='stage2 SSIM weight at switch epoch')
+    parser.add_argument('--ssim_w_end', default=0.2, type=float,
+                        help='stage2 SSIM weight at final epoch')
+    parser.add_argument('--ssim_schedule', default='linear', choices=['linear', 'constant'])
+    parser.add_argument('--use_eca', default=False, type=str2bool,
+                        help='enable ECA module in UKAN decoder/fusion')
+    parser.add_argument('--eca_kernel', default=3, type=int,
+                        help='kernel size of ECA 1D conv')
 
     config = parser.parse_args()
 
@@ -137,17 +158,99 @@ def parse_args():
 
 # [修改2] 定义 MSE + SSIM 组合损失类
 class MSE_SSIM_Loss(nn.Module):
-    def __init__(self, channel=2):
+    def __init__(self, channel=2, ssim_weight=0.1):
         super(MSE_SSIM_Loss, self).__init__()
         self.mse = nn.MSELoss()
         self.ssim_loss = SSIMLoss(window_size=11, channel=channel)
+        self.ssim_weight = ssim_weight
+
+    def set_weight(self, w):
+        self.ssim_weight = float(w)
 
     def forward(self, pred, target):
-        # 1.0 * MSE + 0.1 * SSIM (经验配方)
-        return self.mse(pred, target) + 0.5 * self.ssim_loss(pred, target)
+        return self.mse(pred, target) + self.ssim_weight * self.ssim_loss(pred, target)
 
 
-def train(config, train_loader, model, criterion, optimizer):
+def compute_stage2_ssim_weight(config, epoch):
+    start = config['stage2_start_epoch']
+    end_epoch = max(config['epochs'] - 1, start)
+    w0 = config['ssim_w_start']
+    w1 = config['ssim_w_end']
+    if epoch <= start:
+        return w0
+    if config['ssim_schedule'] == 'constant' or end_epoch == start:
+        return w1
+    ratio = (epoch - start) / float(end_epoch - start)
+    ratio = min(max(ratio, 0.0), 1.0)
+    return w0 + (w1 - w0) * ratio
+
+
+def load_blank_ids(blank_list_file):
+    blank_ids = set()
+    if not os.path.exists(blank_list_file):
+        print(f"Warning: blank list file not found: {blank_list_file}")
+        return blank_ids
+    with open(blank_list_file, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()[1:]
+    for line in lines:
+        first_col = line.split(',')[0].strip()
+        if first_col.isdigit():
+            blank_ids.add(int(first_col))
+    return blank_ids
+
+
+def update_ema(ema_model, model, decay):
+    with torch.no_grad():
+        for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+            ema_param.data.mul_(decay).add_(param.data, alpha=1.0 - decay)
+
+
+def weighted_sample_mean(loss_per_sample, sample_indices, blank_id_set, blank_weight):
+    if (blank_id_set is None) or (len(blank_id_set) == 0):
+        return loss_per_sample.mean()
+    idx_list = sample_indices.detach().cpu().tolist() if torch.is_tensor(sample_indices) else list(sample_indices)
+    is_blank = torch.tensor([i in blank_id_set for i in idx_list], device=loss_per_sample.device, dtype=loss_per_sample.dtype)
+    weights = torch.where(is_blank > 0, torch.full_like(is_blank, blank_weight), torch.ones_like(is_blank))
+    denom = weights.sum().clamp_min(1e-8)
+    return (loss_per_sample * weights).sum() / denom
+
+
+def foreground_mse_loss(pred, target, tau):
+    fg_mask = (target.abs() > tau).float()
+    fg_num = (((pred - target) ** 2) * fg_mask).flatten(1).sum(dim=1)
+    fg_den = fg_mask.flatten(1).sum(dim=1).clamp_min(1.0)
+    return fg_num / fg_den
+
+
+def compute_total_loss(pred, target, criterion, config, sample_indices, blank_id_set=None):
+    if config['blank_strategy'] == 'downweight' and blank_id_set:
+        idx_list = sample_indices.detach().cpu().tolist() if torch.is_tensor(sample_indices) else list(sample_indices)
+        is_blank = torch.tensor([i in blank_id_set for i in idx_list], device=pred.device, dtype=torch.bool)
+        n_blank = int(is_blank.sum().item())
+        n_total = int(is_blank.numel())
+        n_nonblank = n_total - n_blank
+
+        if n_blank == 0 or n_nonblank == 0:
+            base_loss = criterion(pred, target)
+        else:
+            loss_nonblank = criterion(pred[~is_blank], target[~is_blank])
+            loss_blank = criterion(pred[is_blank], target[is_blank])
+            denom = n_nonblank + config['blank_weight'] * n_blank
+            base_loss = (n_nonblank * loss_nonblank + config['blank_weight'] * n_blank * loss_blank) / max(denom, 1e-8)
+    else:
+        base_loss = criterion(pred, target)
+
+    if config['fg_alpha'] > 0:
+        fg_per_sample = foreground_mse_loss(pred, target, config['fg_tau'])
+        if config['blank_strategy'] == 'downweight' and blank_id_set:
+            fg_loss = weighted_sample_mean(fg_per_sample, sample_indices, blank_id_set, config['blank_weight'])
+        else:
+            fg_loss = fg_per_sample.mean()
+        return base_loss + config['fg_alpha'] * fg_loss
+    return base_loss
+
+
+def train(config, train_loader, model, criterion, optimizer, blank_id_set=None, ema_model=None):
     """训练一个epoch（回归任务）"""
     device = config['device']
     avg_meters = {
@@ -160,7 +263,7 @@ def train(config, train_loader, model, criterion, optimizer):
     model.train()
 
     pbar = tqdm(total=len(train_loader), desc='Training')
-    for input, target, _ in train_loader:
+    for input, target, sample_indices in train_loader:
         input = input.to(device)
         target = target.to(device)
 
@@ -171,11 +274,15 @@ def train(config, train_loader, model, criterion, optimizer):
             weights = [0.4, 0.4, 1.0]
             loss = 0
             for output_item, weight in zip(outputs, weights):
-                loss += weight * criterion(output_item, target)
+                loss += weight * compute_total_loss(
+                    output_item, target, criterion, config, sample_indices, blank_id_set=blank_id_set
+                )
             output = outputs[-1]
         else:
             output = model(input)
-            loss = criterion(output, target)
+            loss = compute_total_loss(
+                output, target, criterion, config, sample_indices, blank_id_set=blank_id_set
+            )
 
         # 计算回归指标
         with torch.no_grad():
@@ -187,6 +294,8 @@ def train(config, train_loader, model, criterion, optimizer):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        if ema_model is not None:
+            update_ema(ema_model, model, config['ema_decay'])
 
         # 更新指标
         avg_meters['loss'].update(loss.item(), input.size(0))
@@ -228,7 +337,7 @@ def validate(config, val_loader, model, criterion):
 
     with torch.no_grad():
         pbar = tqdm(total=len(val_loader), desc='Validation')
-        for input, target, _ in val_loader:
+        for input, target, sample_indices in val_loader:
             input = input.to(device)
             target = target.to(device)
 
@@ -238,11 +347,15 @@ def validate(config, val_loader, model, criterion):
                 weights = [0.4, 0.4, 1.0]
                 loss = 0
                 for output_item, weight in zip(outputs, weights):
-                    loss += weight * criterion(output_item, target)
+                    loss += weight * compute_total_loss(
+                        output_item, target, criterion, config, sample_indices, blank_id_set=None
+                    )
                 output = outputs[-1]
             else:
                 output = model(input)
-                loss = criterion(output, target)
+                loss = compute_total_loss(
+                    output, target, criterion, config, sample_indices, blank_id_set=None
+                )
 
             # 计算回归指标
             mse = F.mse_loss(output, target)
@@ -336,31 +449,34 @@ def main():
     config['device'] = device
 
     # [修改3] 损失函数选择逻辑
+    criterion_stage1 = nn.MSELoss().to(device)
     if config['loss'] == 'MSELoss':
-        criterion = nn.MSELoss().to(device)
-        print("✓ 使用 MSE 损失 (DeepNIS Baseline)")
+        criterion_stage2 = nn.MSELoss().to(device)
+        print('Using MSE loss')
     elif config['loss'] == 'MSE_SSIM':
-        criterion = MSE_SSIM_Loss(channel=config['num_classes']).to(device)
-        print("✓ 使用 MSE + SSIM 组合损失 (Proposed)")
+        criterion_stage2 = MSE_SSIM_Loss(
+            channel=config['num_classes'], ssim_weight=config['ssim_w_start']
+        ).to(device)
+        print('Using MSE + SSIM loss')
     elif config['loss'] == 'L1Loss':
-        criterion = nn.L1Loss().to(device)
-        print("✓ 使用 L1 损失")
+        criterion_stage2 = nn.L1Loss().to(device)
+        print('Using L1 loss')
     elif config['loss'] == 'SmoothL1Loss':
-        criterion = nn.SmoothL1Loss().to(device)
-        print("✓ 使用 SmoothL1 损失")
+        criterion_stage2 = nn.SmoothL1Loss().to(device)
+        print('Using SmoothL1 loss')
     else:
-        # 默认回退到 MSE
-        criterion = nn.MSELoss().to(device)
-        print(f"⚠️ 未识别的 Loss: {config['loss']}，默认使用 MSE")
+        criterion_stage2 = nn.MSELoss().to(device)
+        print(f"Unknown loss {config['loss']}, fallback to MSE")
+    print(f"Two-stage training: stage1=MSE, stage2={config['loss']}, switch@epoch={config['stage2_start_epoch']}")
 
-    # 创建模型
-    print("\n创建模型...")
     model = archs.__dict__[config['arch']](
         config['num_classes'],
         config['input_channels'],
         config['deep_supervision'],
         embed_dims=config['input_list'],
-        no_kan=config['no_kan']
+        no_kan=config['no_kan'],
+        use_eca=config['use_eca'],
+        eca_kernel=config['eca_kernel']
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -370,6 +486,15 @@ def main():
     print(f"  总参数量: {total_params / 1e6:.2f}M")
     print(f"  可训练参数: {trainable_params / 1e6:.2f}M")
     print(f"  模型位置: {next(model.parameters()).device}\n")
+
+
+    ema_model = None
+    if config['use_ema']:
+        ema_model = copy.deepcopy(model).to(device)
+        ema_model.eval()
+        for p_ema in ema_model.parameters():
+            p_ema.requires_grad_(False)
+        print(f"EMA enabled: decay={config['ema_decay']}")
 
     # 参数分组（KAN层用不同的学习率）
     param_groups = []
@@ -498,6 +623,18 @@ def main():
     val_indices = indices[test_split: test_split + val_split]  # 200~399
     train_indices = indices[test_split + val_split:]  # 400~1999
 
+
+    blank_id_set = set()
+    if config['blank_strategy'] in ['filter', 'downweight']:
+        blank_id_set = load_blank_ids(config['blank_list_file'])
+        print(f"Blank strategy={config['blank_strategy']}, total blank IDs={len(blank_id_set)}")
+        if config['blank_strategy'] == 'filter' and len(blank_id_set) > 0:
+            before_cnt = len(train_indices)
+            train_indices = [i for i in train_indices if i not in blank_id_set]
+            print(f"Filtered blank samples in train: {before_cnt} -> {len(train_indices)}")
+        elif config['blank_strategy'] == 'downweight':
+            print(f"Downweight blank samples with weight={config['blank_weight']}")
+
     print("\n[Auto-Fix] Calculating normalization stats using Training indices...")
     full_dataset.calculate_normalization_stats(train_indices)
     full_dataset.save_stats(os.path.join(output_dir, exp_name, 'norm_stats.json'))
@@ -557,41 +694,75 @@ def main():
     best_mae = float('inf')
     best_mse = float('inf')
     best_rmse = float('inf')
+    best_monitor = float('inf')
+
+    best_mse_ckpt = float('inf')
     trigger = 0  # 早停计数器
     for epoch in range(config['epochs']):
         print(f'\nEpoch [{epoch}/{config["epochs"]}]')
         print('-' * 60)
 
+        # Stage switch
+        if epoch < config['stage2_start_epoch']:
+            active_criterion = criterion_stage1
+            stage_name = 'stage1_mse'
+        else:
+            active_criterion = criterion_stage2
+            stage_name = 'stage2_target_loss'
+            if config['loss'] == 'MSE_SSIM' and hasattr(criterion_stage2, 'set_weight'):
+                curr_w = compute_stage2_ssim_weight(config, epoch)
+                criterion_stage2.set_weight(curr_w)
+
+        # Reset loss-based early-stopping baseline at stage-2 boundary,
+        # because stage-2 loss scale differs from stage-1.
+        if epoch == config['stage2_start_epoch']:
+            best_loss = float('inf')
+            best_monitor = float('inf')
+            trigger = 0
+            print("=> Entered stage2: reset best_loss and early-stopping trigger.")
+
         # Train
-        train_log = train(config, train_loader, model, criterion, optimizer)
+        train_log = train(
+            config, train_loader, model, active_criterion, optimizer,
+            blank_id_set=blank_id_set if config['blank_strategy'] == 'downweight' else None,
+            ema_model=ema_model
+        )
 
         # Validate
-        val_log = validate(config, val_loader, model, criterion)
+        eval_model = ema_model if ema_model is not None else model
+        val_log = validate(config, val_loader, eval_model, active_criterion)
         # 如果当前的 MAE 比历史最好的还小，就更新历史最好
         if val_log['mae'] < best_mae: best_mae = val_log['mae']
         if val_log['mse'] < best_mse: best_mse = val_log['mse']
         if val_log['rmse'] < best_rmse: best_rmse = val_log['rmse']
 
         # 【核心早停逻辑】 这里我们以 Loss (总误差) 为主要标准来决定要不要保存模型
-        if val_log['loss'] < best_loss:
-            print(f"=> [Epoch {epoch}] Saved best model! (val_loss: {val_log['loss']:.6f})")
+        monitor_key = f"val_{config['early_stop_metric']}"
+        monitor_val = val_log[config['early_stop_metric']]
+        if monitor_val < best_monitor:
+            print(f"=> [Epoch {epoch}] Saved best model! ({monitor_key}: {monitor_val:.6f})")
 
-            # 更新最好 Loss
+            # ???? Loss / Monitor
             best_loss = val_log['loss']
+            best_monitor = monitor_val
 
-            # 保存模型文件
-            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
+            # ??????
+            torch.save(eval_model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
 
-            # 既然进步了，计数器归零
+            # ???????????
             trigger = 0
         else:
-            # 没进步，计数器 +1
+            # ??????? +1
             trigger += 1
-            print(f"=> No improvement for {trigger} epochs.")
+            print(f"=> No improvement for {trigger} epochs on {monitor_key}.")
 
+        if val_log['mse'] < best_mse_ckpt:
+            best_mse_ckpt = val_log['mse']
+            torch.save(eval_model.state_dict(), f'{output_dir}/{exp_name}/model_best_mse.pth')
+            print(f"=> [Epoch {epoch}] Saved best-MSE model! (val_mse: {best_mse_ckpt:.6f})")
         # 打印一下当前的最好模型
         print(
-            f'   Best Results -> Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f}')
+            f'   [{stage_name}] Best Results -> Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f}')
 
         # 触发早停（Early Stopping）
         if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
@@ -635,6 +806,8 @@ def main():
         my_writer.add_scalar('val/mae', val_log['mae'], epoch)
         my_writer.add_scalar('val/rmse', val_log['rmse'], epoch)
         my_writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        if config['loss'] == 'MSE_SSIM' and hasattr(criterion_stage2, 'ssim_weight'):
+            my_writer.add_scalar('loss_weight/ssim', criterion_stage2.ssim_weight, epoch)
         my_writer.add_scalar('best/loss', best_loss, epoch)
         my_writer.add_scalar('best/mae', best_mae, epoch)
         my_writer.add_scalar('best/mse', best_mse, epoch)

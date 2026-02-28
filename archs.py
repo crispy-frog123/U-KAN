@@ -107,6 +107,22 @@ class ChannelLinear(nn.Module):
         return self.conv(x)
 
 
+class ECAAttention(nn.Module):
+    """Efficient Channel Attention (lightweight channel reweighting)."""
+
+    def __init__(self, channels, k_size=3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv1d = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv1d(y.squeeze(-1).transpose(-1, -2))
+        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)
+        return x * y.expand_as(x)
+
+
 class DW_bn_relu(nn.Module):
     """
     深度可分离卷积模块
@@ -318,6 +334,8 @@ class UKAN(nn.Module):
 
         self.deep_supervision = deep_supervision
         self.num_classes = num_classes
+        self.use_eca = kwargs.get('use_eca', False)
+        eca_kernel = kwargs.get('eca_kernel', 3)
 
         # 基础通道数 (Base Channel)
         # 对应 Level 0: embed_dims[0] // 8
@@ -397,6 +415,12 @@ class UKAN(nn.Module):
         self.backdim2 = ChannelLinear(base_dim // 2, base_dim // 4)
         self.backdim1 = ChannelLinear(base_dim // 4, base_dim // 8)
 
+        if self.use_eca:
+            self.eca2s = ECAAttention(base_dim // 4, k_size=eca_kernel)
+            self.eca1s = ECAAttention(base_dim // 8, k_size=eca_kernel)
+            self.eca2 = ECAAttention(base_dim // 4, k_size=eca_kernel)
+            self.eca1 = ECAAttention(base_dim // 8, k_size=eca_kernel)
+
         # --- Final Head ---
         self.final = nn.Conv2d(base_dim // 8, num_classes, kernel_size=1)
 
@@ -438,6 +462,8 @@ class UKAN(nn.Module):
         out = torch.cat((out, t2), dim=1)  # Cat
         out = self.FCSA2s(out)  # Attention
         out = self.backdim2s(out)  # Channel reduction
+        if self.use_eca:
+            out = self.eca2s(out)
         _, _, H, W = out.shape
         out = out.flatten(2).transpose(1, 2)
         for i, blk in enumerate(self.dblock23): out = blk(out, H, W)  # KAN Block
@@ -452,6 +478,8 @@ class UKAN(nn.Module):
         out = torch.cat((out, t1), dim=1)  # Cat
         out = self.FCSA1s(out)
         out = self.backdim1s(out)
+        if self.use_eca:
+            out = self.eca1s(out)
         _, _, H, W = out.shape
         out = out.flatten(2).transpose(1, 2)
         for i, blk in enumerate(self.dblock12): out = blk(out, H, W)
@@ -470,6 +498,8 @@ class UKAN(nn.Module):
         out = torch.cat((out, p2), dim=1)
         out = self.FCSA2(out)
         out = self.backdim2(out)
+        if self.use_eca:
+            out = self.eca2(out)
         fusion2 = out  # 保存中间结果，方便下一级使用
 
         # Fusion Stage 1 (fusion2 upsampled + p1)
@@ -478,6 +508,8 @@ class UKAN(nn.Module):
         out = torch.cat((out, p1), dim=1)
         out = self.FCSA1(out)
         out = self.backdim1(out)
+        if self.use_eca:
+            out = self.eca1(out)
         fusion1 = out
 
         # Final Convolution
@@ -493,4 +525,3 @@ class UKAN(nn.Module):
             return [out_p2, out_p1, final_out]  # 权重建议: [0.4, 0.4, 1.0]
 
         return final_out
-
