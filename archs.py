@@ -32,6 +32,14 @@ from FCS_attention import MultiSpectralAttentionLayer
 __all__ = ['UKAN']
 
 
+def make_gn(channels, max_groups=8):
+    """Create GroupNorm with a valid group count that divides channels."""
+    g = min(max_groups, int(channels))
+    while g > 1 and (channels % g != 0):
+        g -= 1
+    return nn.GroupNorm(g if g > 0 else 1, channels)
+
+
 class SpatialAttention(nn.Module):
     """
     论文 III.B.2) Spatial Attention
@@ -107,22 +115,6 @@ class ChannelLinear(nn.Module):
         return self.conv(x)
 
 
-class ECAAttention(nn.Module):
-    """Efficient Channel Attention (lightweight channel reweighting)."""
-
-    def __init__(self, channels, k_size=3):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv1d = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        y = self.avg_pool(x)
-        y = self.conv1d(y.squeeze(-1).transpose(-1, -2))
-        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)
-        return x * y.expand_as(x)
-
-
 class DW_bn_relu(nn.Module):
     """
     深度可分离卷积模块
@@ -132,7 +124,7 @@ class DW_bn_relu(nn.Module):
     def __init__(self, dim=768):
         super(DW_bn_relu, self).__init__()
         self.dwconv = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
-        self.bn = nn.BatchNorm2d(dim)
+        self.bn = make_gn(dim)
         self.relu = nn.ReLU()
 
     def forward(self, x, H, W):
@@ -308,10 +300,10 @@ class D_ConvLayer(nn.Module):
         super(D_ConvLayer, self).__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, padding=1),
-            nn.BatchNorm2d(in_ch),
+            make_gn(in_ch),
             nn.ReLU(inplace=True),
             nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            make_gn(out_ch),
             nn.ReLU(inplace=True)
         )
 
@@ -334,14 +326,17 @@ class UKAN(nn.Module):
 
         self.deep_supervision = deep_supervision
         self.num_classes = num_classes
-        self.use_eca = kwargs.get('use_eca', False)
-        eca_kernel = kwargs.get('eca_kernel', 3)
 
         # 基础通道数 (Base Channel)
         # 对应 Level 0: embed_dims[0] // 8
         # 对应 Level 1: embed_dims[0] // 4
         # 对应 Level 2: embed_dims[0]     <-- Bottleneck (Stage 3)
         base_dim = embed_dims[0]
+
+        # Keep KAN at low-resolution stages only (bottleneck and coarse decoder)
+        self.lowres_kan_only = kwargs.get('lowres_kan_only', False)
+        self.detail_skip = kwargs.get('detail_skip', False)
+        self.detail_alpha = float(kwargs.get('detail_alpha', 0.1))
 
         # --- 归一化层 (保留前3层) ---
         self.norm0 = norm_layer(base_dim // 8)
@@ -355,22 +350,25 @@ class UKAN(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
         # --- KAN Blocks (Encoder) ---
-        # Stage 1
+        # High-resolution stages can disable KAN to preserve edges and reduce over-smoothing.
+        highres_no_kan = self.lowres_kan_only or no_kan
+
+        # Stage 1 (high-res)
         self.block01 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer)])
-        # Stage 2
+            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer, no_kan=highres_no_kan)])
+        # Stage 2 (mid-res)
         self.block12 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer)])
-        # Stage 3 (Bottleneck)
-        self.block23 = nn.ModuleList([KANBlock(dim=base_dim, drop=drop_rate, drop_path=dpr[2], norm_layer=norm_layer)])
+            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer, no_kan=highres_no_kan)])
+        # Stage 3 (Bottleneck, keep KAN unless global no_kan=True)
+        self.block23 = nn.ModuleList([KANBlock(dim=base_dim, drop=drop_rate, drop_path=dpr[2], norm_layer=norm_layer, no_kan=no_kan)])
 
         # --- KAN Blocks (Decoder) ---
-        # Decode Stage 2
+        # Decode Stage 2 (coarse, keep KAN unless global no_kan=True)
         self.dblock23 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer)])
-        # Decode Stage 1
+            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer, no_kan=no_kan)])
+        # Decode Stage 1 (high-res)
         self.dblock12 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer)])
+            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer, no_kan=highres_no_kan)])
 
         # --- Patch Embed (Encoder Downsampling) ---
         # Stage 1: Input -> Level 0
@@ -415,14 +413,17 @@ class UKAN(nn.Module):
         self.backdim2 = ChannelLinear(base_dim // 2, base_dim // 4)
         self.backdim1 = ChannelLinear(base_dim // 4, base_dim // 8)
 
-        if self.use_eca:
-            self.eca2s = ECAAttention(base_dim // 4, k_size=eca_kernel)
-            self.eca1s = ECAAttention(base_dim // 8, k_size=eca_kernel)
-            self.eca2 = ECAAttention(base_dim // 4, k_size=eca_kernel)
-            self.eca1 = ECAAttention(base_dim // 8, k_size=eca_kernel)
-
         # --- Final Head ---
         self.final = nn.Conv2d(base_dim // 8, num_classes, kernel_size=1)
+
+        # --- Detail Skip Head (input -> edge/detail compensation) ---
+        detail_mid = max(base_dim // 16, 8)
+        self.detail_head = nn.Sequential(
+            nn.Conv2d(input_channels, detail_mid, kernel_size=3, padding=1, bias=False),
+            make_gn(detail_mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(detail_mid, num_classes, kernel_size=1, bias=True),
+        )
 
         # --- Deep Supervision Heads ---
         if self.deep_supervision:
@@ -462,8 +463,6 @@ class UKAN(nn.Module):
         out = torch.cat((out, t2), dim=1)  # Cat
         out = self.FCSA2s(out)  # Attention
         out = self.backdim2s(out)  # Channel reduction
-        if self.use_eca:
-            out = self.eca2s(out)
         _, _, H, W = out.shape
         out = out.flatten(2).transpose(1, 2)
         for i, blk in enumerate(self.dblock23): out = blk(out, H, W)  # KAN Block
@@ -478,8 +477,6 @@ class UKAN(nn.Module):
         out = torch.cat((out, t1), dim=1)  # Cat
         out = self.FCSA1s(out)
         out = self.backdim1s(out)
-        if self.use_eca:
-            out = self.eca1s(out)
         _, _, H, W = out.shape
         out = out.flatten(2).transpose(1, 2)
         for i, blk in enumerate(self.dblock12): out = blk(out, H, W)
@@ -498,8 +495,6 @@ class UKAN(nn.Module):
         out = torch.cat((out, p2), dim=1)
         out = self.FCSA2(out)
         out = self.backdim2(out)
-        if self.use_eca:
-            out = self.eca2(out)
         fusion2 = out  # 保存中间结果，方便下一级使用
 
         # Fusion Stage 1 (fusion2 upsampled + p1)
@@ -508,13 +503,13 @@ class UKAN(nn.Module):
         out = torch.cat((out, p1), dim=1)
         out = self.FCSA1(out)
         out = self.backdim1(out)
-        if self.use_eca:
-            out = self.eca1(out)
         fusion1 = out
 
         # Final Convolution
         out = F.relu(F.interpolate(self.decoder5(fusion1), scale_factor=(2, 2), mode='bilinear'))
         final_out = self.final(out)
+        if self.detail_skip:
+            final_out = final_out + self.detail_alpha * self.detail_head(x)
 
         if self.deep_supervision:
             input_size = x.shape[2:]

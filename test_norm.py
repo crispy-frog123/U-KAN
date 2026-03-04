@@ -35,6 +35,8 @@ def parse_args():
     # [新增可选项]
     parser.add_argument('--new_data_dir', type=str, default=None,
                         help='[Optional] Path to a folder containing NEW dataset .mat files.')
+    parser.add_argument('--tta_rotate', action='store_true',
+                        help='enable 4-way rotation TTA')
 
     return parser.parse_args()
 
@@ -57,6 +59,29 @@ def calculate_metrics_detailed(pred, target):
     return mse_real, mse_imag, ssim_real, ssim_imag
 
 
+def forward_once(model, x):
+    outputs = model(x)
+    return outputs[-1] if isinstance(outputs, list) else outputs
+
+
+def predict_with_tta_rotate(model, x):
+    preds = []
+    for k in [0, 1, 2, 3]:
+        xr = torch.rot90(x, k, dims=[2, 3])
+        yr = forward_once(model, xr)
+        y = torch.rot90(yr, -k, dims=[2, 3])
+        preds.append(y)
+    return torch.stack(preds, dim=0).mean(dim=0)
+
+
+def denorm_input_tensor_for_residual(x, dataset):
+    """Recover raw input from z-score normalized tensor using loaded dataset stats."""
+    base = x.clone()
+    base[:, 0, :, :] = base[:, 0, :, :] * float(dataset.inp_real_std) + float(dataset.inp_real_mean)
+    base[:, 1, :, :] = base[:, 1, :, :] * float(dataset.inp_imag_std) + float(dataset.inp_imag_mean)
+    return base
+
+
 def main():
     args = parse_args()
 
@@ -72,6 +97,7 @@ def main():
     print(f"\n{'=' * 60}")
     print(f" Evaluation: {config.get('name', 'Unknown')}")
     print(f" Model Arch: {config['arch']}")
+    print(f" TTA Rotate: {args.tta_rotate}")
     print(f"{'=' * 60}\n")
 
     # ================= 2. 数据集路径选择逻辑 =================
@@ -154,7 +180,12 @@ def main():
         config['input_channels'],
         config['deep_supervision'],
         embed_dims=config['input_list'],
-        no_kan=config.get('no_kan', False)
+        no_kan=config.get('no_kan', False),
+        use_eca=config.get('use_eca', False),
+        eca_kernel=config.get('eca_kernel', 3),
+        lowres_kan_only=config.get('lowres_kan_only', False),
+        detail_skip=config.get('detail_skip', False),
+        detail_alpha=config.get('detail_alpha', 0.1)
     ).to(device)
 
     model_path = os.path.join(args.exp_dir, args.checkpoint)
@@ -195,11 +226,10 @@ def main():
             input_tensor = input_tensor.to(device)
             target = target.to(device)
 
-            outputs = model(input_tensor)
-            if isinstance(outputs, list):
-                pred = outputs[-1]
+            if args.tta_rotate:
+                pred = predict_with_tta_rotate(model, input_tensor)
             else:
-                pred = outputs
+                pred = forward_once(model, input_tensor)
 
             pred_np = pred.cpu().numpy().squeeze(0)
             target_np = target.cpu().numpy().squeeze(0)
