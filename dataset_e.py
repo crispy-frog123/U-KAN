@@ -11,20 +11,19 @@ class ComplexMatDataset(Dataset):
     def __init__(self, real_img_path, imag_img_path, real_label_path, imag_label_path,
                  img_size=(64, 64), transform=None, normalize_method='z-score'):
         """
-        Modified Dataset for DeepNIS:
-        1. Input (chi0): Uses Z-Score Normalization.
-        2. Label (chi):  USES NO NORMALIZATION (Raw values [-2, 0]).
+        Dataset for complex-valued tomography data.
+        Input (chi0) is z-score normalized, whereas labels (chi) remain unnormalized.
         """
         self.transform = transform
         self.normalize_method = normalize_method
 
-        # 1. Load Data
+        # Load raw arrays from MAT files.
         self.real_img = self._load_mat(real_img_path)
         self.imag_img = self._load_mat(imag_img_path)
         self.real_label = self._load_mat(real_label_path)
         self.imag_label = self._load_mat(imag_label_path)
 
-        # Ensure correct shape (N, H, W) or (H, W, N) -> (N, H, W)
+        # Enforce sample-major layout: (N, H, W).
         self.real_img = self._check_dims(self.real_img)
         self.imag_img = self._check_dims(self.imag_img)
         self.real_label = self._check_dims(self.real_label)
@@ -32,14 +31,13 @@ class ComplexMatDataset(Dataset):
 
         self.img_size = img_size
 
-        # 2. Initialize Normalization Stats (Default to Identity/No-op)
-        # Input Stats (will be updated by calculate_normalization_stats)
+        # Initialize input normalization statistics.
         self.inp_real_mean = 0.0
         self.inp_real_std = 1.0
         self.inp_imag_mean = 0.0
         self.inp_imag_std = 1.0
 
-        # Label Stats (Not used for normalization, but kept for reference)
+        # Keep label range metadata for analysis.
         self.lbl_real_max = 1.0
         self.lbl_real_min = 0.0
 
@@ -56,10 +54,9 @@ class ComplexMatDataset(Dataset):
                 return f[keys[0]][:]
 
     def _check_dims(self, data):
-        # Assuming data is (H*W, N) or (N, H*W) or similar flat structure based on previous context
-        # Adjust this if your raw .mat is already (N, 64, 64)
+        # Convert flattened representations into (N, 64, 64) when needed.
         if data.ndim == 2:
-            # Heuristic: usually N is 2000 or 4000, 4096 is 64*64
+            # Heuristic: 4096 = 64 x 64.
             if data.shape[0] == 4096:
                 # (4096, N) -> (N, 64, 64)
                 N = data.shape[1]
@@ -72,18 +69,18 @@ class ComplexMatDataset(Dataset):
 
     def calculate_normalization_stats(self, indices):
         """
-        Calculate stats ONLY for Inputs using training indices.
-        Labels are intentionally NOT normalized to preserve sparsity (0 background).
+        Compute input normalization statistics from training samples only.
+        Labels are intentionally kept in physical scale.
         """
         print(f"Computing Input normalization stats on {len(indices)} training samples...")
 
-        # Select training subset
+        # Select training subset.
         train_real = self.real_img[indices]
         train_imag = self.imag_img[indices]
 
-        # Calculate Z-Score params for INPUT
+        # Compute z-score parameters for the input channels.
         self.inp_real_mean = float(np.mean(train_real))
-        self.inp_real_std = float(np.std(train_real)) + 1e-8  # avoid div by zero
+        self.inp_real_std = float(np.std(train_real)) + 1e-8  # Numerical safeguard.
 
         self.inp_imag_mean = float(np.mean(train_imag))
         self.inp_imag_std = float(np.std(train_imag)) + 1e-8
@@ -94,7 +91,7 @@ class ComplexMatDataset(Dataset):
         print(f"  [Label] skipped (keeping raw values for physics consistency).")
 
     def save_stats(self, save_path):
-        """Save input stats to JSON for consistency in Testing."""
+        """Persist input statistics to JSON for reproducible evaluation."""
         stats = {
             'inp_real_mean': self.inp_real_mean,
             'inp_real_std': self.inp_real_std,
@@ -107,7 +104,7 @@ class ComplexMatDataset(Dataset):
         print(f"Normalization stats saved to {save_path}")
 
     def load_stats(self, load_path):
-        """Load input stats from JSON."""
+        """Load previously saved input statistics from JSON."""
         if not os.path.exists(load_path):
             print(f"Warning: Stats file {load_path} not found! Using Identity norm.")
             return
@@ -126,22 +123,19 @@ class ComplexMatDataset(Dataset):
         return self.real_img.shape[0]
 
     def __getitem__(self, idx):
-        # 1. Get Data
+        # Retrieve raw sample.
         input_r = self.real_img[idx]
         input_i = self.imag_img[idx]
         label_r = self.real_label[idx]
         label_i = self.imag_label[idx]
 
-        # 2. Normalize INPUT ONLY (Z-Score)
-        # (input - mean) / std
+        # Apply z-score normalization to input channels only.
         input_r = (input_r - self.inp_real_mean) / self.inp_real_std
         input_i = (input_i - self.inp_imag_mean) / self.inp_imag_std
 
-        # 3. Handle LABEL (Do NOT normalize)
-        # Keep them as raw float values.
-        # If you want to scale them slightly (e.g. /2.0), do it here, but raw is fine.
+        # Labels remain unnormalized in physical units.
 
-        # 4. To Tensor (C, H, W)
+        # Convert to channel-first tensors: (C, H, W).
         input_tensor = torch.stack([
             torch.from_numpy(input_r).float(),
             torch.from_numpy(input_i).float()
@@ -152,16 +146,8 @@ class ComplexMatDataset(Dataset):
             torch.from_numpy(label_i).float()
         ], dim=0)
 
-        # 5. Apply Transforms (if any, usually Resize)
-        # Note: Transform logic usually expects HWC or CHW.
-        # Since we manually stacked CHW, make sure transform handles it or apply before stack.
-        # Assuming transform is just Resize which works on Tensor or PIL.
-        # If your transform is complex (albumentations), it needs numpy HWC.
-        # Keeping it simple for now based on your code:
+        # Optional transform hook; no-op in this implementation.
         if self.transform:
-            # Naive transform application (assuming simple torch transforms)
-            # If using Albumentations, strict adaptation is needed.
-            # Here we return tensor directly as your code seemed to handle transforms externally or minimally.
             pass
 
         return input_tensor, label_tensor, idx
@@ -169,7 +155,7 @@ class ComplexMatDataset(Dataset):
 
 class TransformSubset(Dataset):
     """
-    Subset wrapper to apply transforms dynamically
+    Subset wrapper that applies transforms at retrieval time.
     """
 
     def __init__(self, dataset, indices, transform=None):
@@ -181,15 +167,12 @@ class TransformSubset(Dataset):
         real_idx = self.indices[idx]
         input_tensor, label_tensor, _ = self.dataset[real_idx]
 
-        # Apply Albumentations or Resize here if needed
-        # Convert to numpy HWC for Albumentations
+        # Apply transform in HWC format for Albumentations compatibility.
         if self.transform:
             input_np = input_tensor.permute(1, 2, 0).numpy()  # (H, W, C)
             label_np = label_tensor.permute(1, 2, 0).numpy()
 
-            # Apply same transform to input and label? usually inputs only for aug,
-            # but resize must be both.
-            # Assuming 'transform' is just Resize for now based on context.
+            # Apply joint transform to preserve input-label alignment.
             augmented = self.transform(image=input_np, mask=label_np)
             input_np = augmented['image']
             label_np = augmented['mask']

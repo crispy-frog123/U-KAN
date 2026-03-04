@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import os
 import random
 import torch
@@ -18,7 +18,6 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# ================= 配置区 =================
 DATA_PATHS = {
     'real_img': 'data/chi0_all_real_mnist.mat',
     'imag_img': 'data/chi0_all_imag_mnist.mat',
@@ -41,7 +40,7 @@ def parse_args():
 
 
 def denormalize_input(img_tensor, stats):
-    """手动反归一化 Input"""
+    """Apply manual de-normalization to the input sample."""
     if stats is None:
         return img_tensor
 
@@ -62,7 +61,7 @@ def denormalize_input(img_tensor, stats):
 
 
 def calculate_detailed_metrics(pred, target):
-    """同时计算 SSIM 和 MSE"""
+    """Compute SSIM and MSE metrics for real and imaginary channels."""
     range_real = target[0].max() - target[0].min() + 1e-6
     range_imag = target[1].max() - target[1].min() + 1e-6
 
@@ -76,7 +75,7 @@ def calculate_detailed_metrics(pred, target):
 
 
 def create_mosaic(images_list, rows=4, cols=4, padding=2):
-    """拼接马赛克大图"""
+    """Assemble multiple images into a tiled mosaic."""
     count = len(images_list)
     if count == 0: return None
 
@@ -101,7 +100,7 @@ def create_mosaic(images_list, rows=4, cols=4, padding=2):
 
 
 def save_metrics_to_txt(samples, save_dir, filename="metric.txt"):
-    """保存指标"""
+    """Save per-sample metrics to a text report."""
     path = os.path.join(save_dir, filename)
     print(f"Saving metrics to {path}...")
 
@@ -137,7 +136,6 @@ def test_remaining_fig3_style():
 
     print(f"Running in [Fig.3 Triple Column (Input-GT-Pred)] mode...")
 
-    # 1. 加载数据
     if not os.path.exists(INDICES_PATH): raise FileNotFoundError(f"Missing indices: {INDICES_PATH}")
     mat_content = sio.loadmat(INDICES_PATH)
     test_indices = (mat_content['test_indices'][0] - 1).astype(np.int64)
@@ -151,7 +149,6 @@ def test_remaining_fig3_style():
         normalize_method='z-score'
     )
 
-    # 加载 stats 用于反归一化 Input
     norm_stats = None
     stats_path = os.path.join(args.exp_dir, 'norm_stats.json')
     if os.path.exists(stats_path):
@@ -163,7 +160,6 @@ def test_remaining_fig3_style():
     test_subset = Subset(full_dataset, test_indices)
     test_loader = DataLoader(test_subset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    # 2. 加载模型
     model = archs.__dict__['UKAN'](num_classes=2, input_channels=2).to(device)
     ckpt_path = os.path.join(args.exp_dir, 'model.pth')
     if not os.path.exists(ckpt_path): ckpt_path = os.path.join(args.exp_dir, 'best_model.pth')
@@ -175,7 +171,6 @@ def test_remaining_fig3_style():
         model.load_state_dict(ckpt, strict=False)
     model.eval()
 
-    # 3. 随机抽取 16 个样本
     random.seed(42)
     vis_global_indices = set(random.sample(range(len(test_subset)), 16))
     saved_samples = []
@@ -191,20 +186,18 @@ def test_remaining_fig3_style():
 
             pred_np = output.cpu().numpy()
             target_np = target.cpu().numpy()
-            input_np = input_tensor.cpu().numpy()  # 获取 Input
+            input_np = input_tensor.cpu().numpy()  # Standardized technical note.
 
             for j in range(batch_size):
                 global_id = current_idx + j
                 if global_id in vis_global_indices:
-                    # 计算指标 (Pred vs Target)
                     s_r, s_i, m_r, m_i = calculate_detailed_metrics(pred_np[j], target_np[j])
 
-                    # 反归一化 Input 用于展示
                     input_phys = denormalize_input(input_np[j], norm_stats)
 
                     saved_samples.append({
                         'id': global_id,
-                        'input': input_phys,  # 保存 Input
+                        'input': input_phys,  # Standardized technical note.
                         'target': target_np[j],
                         'pred': pred_np[j],
                         'ssim_r': s_r, 'ssim_i': s_i,
@@ -223,18 +216,15 @@ def test_remaining_fig3_style():
 def plot_paper_fig3_style_triple(samples, save_dir):
     print("Generating Triple-Column (Input | GT | Pred) Rotated Plots...")
 
-    # 准备数据 (全部逆时针旋转 90度)
     input_real_list = [np.rot90(s['input'][0], k=1) for s in samples]
     gt_real_list = [np.rot90(s['target'][0], k=1) for s in samples]
     pred_real_list = [np.rot90(s['pred'][0], k=1) for s in samples]
 
-    # 虚部先取绝对值，再旋转
     input_imag_list = [np.rot90(np.abs(s['input'][1]), k=1) for s in samples]
     gt_imag_list = [np.rot90(np.abs(s['target'][1]), k=1) for s in samples]
     pred_imag_list = [np.rot90(np.abs(s['pred'][1]), k=1) for s in samples]
 
     padding = 2
-    # 拼接 Mosaic
     mosaic_in_r = create_mosaic(input_real_list, 4, 4, padding)
     mosaic_gt_r = create_mosaic(gt_real_list, 4, 4, padding)
     mosaic_pd_r = create_mosaic(pred_real_list, 4, 4, padding)
@@ -243,23 +233,16 @@ def plot_paper_fig3_style_triple(samples, save_dir):
     mosaic_gt_i = create_mosaic(gt_imag_list, 4, 4, padding)
     mosaic_pd_i = create_mosaic(pred_imag_list, 4, 4, padding)
 
-    # ================= 1. 实部图 (1行3列: Input | GT | Pred) =================
-    # 画布加宽：24宽 (3x8)
     fig, axes = plt.subplots(1, 3, figsize=(24, 8))
 
-    # GT 和 Pred 必须统一量程以对比
     vmin_gp = min(mosaic_gt_r.min(), mosaic_pd_r.min())
     vmax_gp = max(mosaic_gt_r.max(), mosaic_pd_r.max())
 
-    # Input 量程自适应 (因为 BP 图像数值可能和 Permittivity 不在一个量级)
-    # 也可以手动指定 Input 也是 vmin_gp/vmax_gp，但这可能导致 Input 看起来全黑或全白
-    # 建议：Input 用自适应，GT/Pred 用统一。
 
     # Left: Input
-    im1 = axes[0].imshow(mosaic_in_r, cmap='jet')  # 自适应
+    im1 = axes[0].imshow(mosaic_in_r, cmap='jet')  # Standardized technical note.
     axes[0].set_title("Input (Real)", fontsize=20, fontweight='bold', pad=15)
     axes[0].axis('off')
-    # Input 独享一个小的 Colorbar? 或者省略
     plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
     # Middle: GT
@@ -272,7 +255,6 @@ def plot_paper_fig3_style_triple(samples, save_dir):
     axes[2].set_title("Pred (Real)", fontsize=20, fontweight='bold', pad=15)
     axes[2].axis('off')
 
-    # GT 和 Pred 共用一个大的 Colorbar
     cbar = fig.colorbar(im3, ax=[axes[1], axes[2]], fraction=0.03, pad=0.04)
     cbar.ax.tick_params(labelsize=16)
     for l in cbar.ax.yaxis.get_ticklabels(): l.set_weight('bold')
@@ -281,12 +263,11 @@ def plot_paper_fig3_style_triple(samples, save_dir):
     plt.savefig(save_path_r, dpi=300, bbox_inches='tight')
     plt.close()
 
-    # ================= 2. 虚部图 (|Imag|) =================
     fig, axes = plt.subplots(1, 3, figsize=(24, 8))
     vmax_gp_i = max(mosaic_gt_i.max(), mosaic_pd_i.max())
 
     # Left: Input
-    im1 = axes[0].imshow(mosaic_in_i, cmap='jet')  # 自适应, Abs 最小为0
+    im1 = axes[0].imshow(mosaic_in_i, cmap='jet')  # Standardized technical note.
     axes[0].set_title("Input (|Imag|)", fontsize=20, fontweight='bold', pad=15)
     axes[0].axis('off')
     plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
@@ -309,7 +290,7 @@ def plot_paper_fig3_style_triple(samples, save_dir):
     plt.savefig(save_path_i, dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✓ Results saved:\n  - {save_path_r}\n  - {save_path_i}\n  - metric.txt")
+    print(f"[INFO] Results saved:\n  - {save_path_r}\n  - {save_path_i}\n  - metric.txt")
 
 
 if __name__ == '__main__':

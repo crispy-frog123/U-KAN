@@ -11,8 +11,7 @@ from torch.nn import functional as F
 from torch.autograd import Variable
 
 class PAM_Module(Module):
-    """ Position attention module"""
-    #Ref from SAGAN
+    """Position attention module."""
     def __init__(self, in_dim):
         super(PAM_Module, self).__init__()
         self.chanel_in = in_dim
@@ -132,8 +131,7 @@ class MultiSpectralAttentionLayer(torch.nn.Module):
         self.num_split = len(mapper_x)
         mapper_x = [temp_x * (dct_h // 7) for temp_x in mapper_x]
         mapper_y = [temp_y * (dct_w // 7) for temp_y in mapper_y]
-        # make the frequencies in different sizes are identical to a 7x7 frequency space
-        # eg, (2,2) in 14x14 is identical to (1,1) in 7x7
+        # Map selected frequencies to the canonical 7x7 DCT index space.
 
         self.dct_layer = MultiSpectralDCTLayer(dct_h, dct_w, mapper_x, mapper_y, channel)
         self.fc = nn.Sequential(
@@ -148,9 +146,7 @@ class MultiSpectralAttentionLayer(torch.nn.Module):
         x_pooled = x
         if h != self.dct_h or w != self.dct_w:
             x_pooled = torch.nn.functional.adaptive_avg_pool2d(x, (self.dct_h, self.dct_w))
-            # If you have concerns about one-line-change, don't worry.   :)
-            # In the ImageNet models, this line will never be triggered.
-            # This is for compatibility in instance segmentation and object detection.
+            # This branch ensures shape compatibility for variable-resolution inputs.
         y = self.dct_layer(x_pooled)
 
         y = self.fc(y).view(n, c, 1, 1)
@@ -159,7 +155,7 @@ class MultiSpectralAttentionLayer(torch.nn.Module):
 
 class MultiSpectralDCTLayer(nn.Module):
     """
-    Generate dct filters
+    Generate fixed DCT filters.
     """
 
     def __init__(self, height, width, mapper_x, mapper_y, channel):
@@ -170,19 +166,19 @@ class MultiSpectralDCTLayer(nn.Module):
 
         self.num_freq = len(mapper_x)
 
-        # fixed DCT init
+        # Fixed DCT initialization.
         self.register_buffer('weight', self.get_dct_filter(height, width, mapper_x, mapper_y, channel))
 
-        # fixed random init
+        # Fixed random initialization (ablation only).
         # self.register_buffer('weight', torch.rand(channel, height, width))
 
-        # learnable DCT init
+        # Learnable DCT initialization (ablation only).
         # self.register_parameter('weight', self.get_dct_filter(height, width, mapper_x, mapper_y, channel))
 
-        # learnable random init
+        # Learnable random initialization (ablation only).
         # self.register_parameter('weight', torch.rand(channel, height, width))
 
-        # num_freq, h, w
+        # Tensor shape: (num_freq, h, w).
 
     def forward(self, x):
         assert len(x.shape) == 4, 'x must been 4 dimensions, but got ' + str(len(x.shape))

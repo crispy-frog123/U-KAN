@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 from collections import OrderedDict
@@ -23,7 +23,6 @@ from albumentations import RandomRotate90, Resize
 
 import archs
 from dataset_e import ComplexMatDataset, TransformSubset
-# [淇敼1] 纭繚瀵煎叆 SSIMLoss
 from utils import AverageMeter, str2bool, SSIMLoss
 from torch.utils.tensorboard import SummaryWriter
 
@@ -69,13 +68,9 @@ def parse_args():
                         help='image height')
     parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
 
-    # loss [鎻愮ず] 杩欓噷鍙互鐩存帴浼?MSELoss 鎴?MSE_SSIM
     parser.add_argument('--loss', default='MSELoss',
                         help='loss function: MSELoss | MSE_SSIM')
-    parser.add_argument('--ssim_weight', default=0.5, type=float,
-                        help='SSIM weight used in MSE_SSIM loss')
 
-    # 澶嶆暟鏁版嵁闆嗚矾寰?
     parser.add_argument('--data_dir', default='inputs', help='dataset base directory')
 
     parser.add_argument('--real_img_file', default='input/chi0_all_real_mnist.mat',
@@ -129,125 +124,26 @@ def parse_args():
     parser.add_argument('--gamma', default=2 / 3, type=float)
     parser.add_argument('--early_stopping', default=60, type=int,
                         metavar='N', help='early stopping (default: 60)')
-    parser.add_argument('--early_stop_metric', default='mse', type=str,
-                        choices=['mse', 'ssim'],
-                        help='metric used for early stopping and model.pth alias')
 
     parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--no_kan', action='store_true')
-    parser.add_argument('--lowres_kan_only', default=False, type=str2bool,
-                        help='use KAN only at low-resolution stages (bottleneck/coarse decoder)')
-    parser.add_argument('--residual_learning', default=False, type=str2bool,
-                        help='predict residual and add denormalized input as base')
-    parser.add_argument('--detail_skip', default=False, type=str2bool,
-                        help='add a lightweight input-detail skip head to final output')
-    parser.add_argument('--detail_alpha', default=0.1, type=float,
-                        help='weight of detail skip branch')
-    parser.add_argument('--boundary_alpha', default=0.0, type=float,
-                        help='boundary-focused penalty weight (0 disables)')
-    parser.add_argument('--boundary_start_epoch', default=120, type=int,
-                        help='start epoch for boundary-focused penalty')
-    parser.add_argument('--boundary_tau', default=0.7, type=float,
-                        help='quantile threshold for boundary mask [0,1)')
-    parser.add_argument('--boundary_under_w', default=2.0, type=float,
-                        help='extra weight for under-estimation on boundaries')
-    parser.add_argument('--tv_alpha', default=0.0, type=float,
-                        help='total variation regularization weight (0 disables)')
-    parser.add_argument('--tv_start_epoch', default=120, type=int,
-                        help='start epoch for TV regularization')
 
     config = parser.parse_args()
 
     return config
 
-# [淇敼2] 瀹氫箟 MSE + SSIM 缁勫悎鎹熷け绫?
 class MSE_SSIM_Loss(nn.Module):
-    def __init__(self, channel=2, ssim_weight=0.5):
+    def __init__(self, channel=2):
         super(MSE_SSIM_Loss, self).__init__()
         self.mse = nn.MSELoss()
         self.ssim_loss = SSIMLoss(window_size=11, channel=channel)
-        self.ssim_weight = float(ssim_weight)
 
     def forward(self, pred, target):
-        # 1.0 * MSE + 0.1 * SSIM (缁忛獙閰嶆柟)
-        return self.mse(pred, target) + self.ssim_weight * self.ssim_loss(pred, target)
+        return self.mse(pred, target) + 0.5 * self.ssim_loss(pred, target)
 
 
-def _sobel_kernels(device, dtype):
-    kx = torch.tensor([[-1.0, 0.0, 1.0],
-                       [-2.0, 0.0, 2.0],
-                       [-1.0, 0.0, 1.0]], device=device, dtype=dtype).view(1, 1, 3, 3)
-    ky = torch.tensor([[-1.0, -2.0, -1.0],
-                       [0.0, 0.0, 0.0],
-                       [1.0, 2.0, 1.0]], device=device, dtype=dtype).view(1, 1, 3, 3)
-    return kx, ky
-
-
-def sobel_grad_mag(x):
-    c = x.shape[1]
-    kx, ky = _sobel_kernels(x.device, x.dtype)
-    kx = kx.repeat(c, 1, 1, 1)
-    ky = ky.repeat(c, 1, 1, 1)
-    gx = F.conv2d(x, kx, padding=1, groups=c)
-    gy = F.conv2d(x, ky, padding=1, groups=c)
-    return torch.sqrt(gx * gx + gy * gy + 1e-12)
-
-
-def boundary_under_loss(pred, target, tau=0.7, under_w=2.0):
-    grad = sobel_grad_mag(target)
-    tau = float(max(0.0, min(0.99, tau)))
-
-    q = torch.quantile(grad.detach().reshape(-1), tau)
-    mask = (grad >= q).float()
-    if mask.mean() < 1e-3:
-        mask = grad / (grad.mean().detach() + 1e-6)
-
-    l_abs = (mask * torch.abs(pred - target)).mean()
-    l_under = (mask * F.relu(torch.abs(target) - torch.abs(pred))).mean()
-    return l_abs + float(under_w) * l_under
-
-
-def total_variation_loss(x):
-    dx = x[:, :, 1:, :] - x[:, :, :-1, :]
-    dy = x[:, :, :, 1:] - x[:, :, :, :-1]
-    return dx.abs().mean() + dy.abs().mean()
-
-
-def apply_optional_regularizers(base_loss, pred, target, config, epoch):
-    loss = base_loss
-
-    if config.get('boundary_alpha', 0.0) > 0 and epoch >= config.get('boundary_start_epoch', 0):
-        b_loss = boundary_under_loss(
-            pred,
-            target,
-            tau=config.get('boundary_tau', 0.7),
-            under_w=config.get('boundary_under_w', 2.0)
-        )
-        loss = loss + config['boundary_alpha'] * b_loss
-
-    if config.get('tv_alpha', 0.0) > 0 and epoch >= config.get('tv_start_epoch', 0):
-        tv = total_variation_loss(pred)
-        loss = loss + config['tv_alpha'] * tv
-
-    return loss
-
-
-def denorm_input_tensor(x, config):
-    """Recover raw input from z-score normalized tensor for residual learning."""
-    if not config.get('residual_learning', False):
-        return x
-    r_mean = float(config.get('inp_real_mean', 0.0))
-    r_std = float(config.get('inp_real_std', 1.0))
-    i_mean = float(config.get('inp_imag_mean', 0.0))
-    i_std = float(config.get('inp_imag_std', 1.0))
-    base = x.clone()
-    base[:, 0, :, :] = base[:, 0, :, :] * r_std + r_mean
-    base[:, 1, :, :] = base[:, 1, :, :] * i_std + i_mean
-    return base
-
-
-def train(config, train_loader, model, criterion, optimizer, epoch):
-    """璁粌涓€涓猠poch锛堝洖褰掍换鍔★級"""
+def train(config, train_loader, model, criterion, optimizer):
+    """Run one training epoch for the regression objective."""
     device = config['device']
     avg_meters = {
         'loss': AverageMeter(),
@@ -266,19 +162,15 @@ def train(config, train_loader, model, criterion, optimizer, epoch):
         # Forward
         if config['deep_supervision']:
             outputs = model(input)
-            # Deep Supervision 鍔犳潈 Loss
             weights = [0.4, 0.4, 1.0]
             loss = 0
             for output_item, weight in zip(outputs, weights):
                 loss += weight * criterion(output_item, target)
             output = outputs[-1]
-            loss = apply_optional_regularizers(loss, output, target, config, epoch)
         else:
             output = model(input)
             loss = criterion(output, target)
-            loss = apply_optional_regularizers(loss, output, target, config, epoch)
 
-        # 璁＄畻鍥炲綊鎸囨爣
         with torch.no_grad():
             mse = F.mse_loss(output, target)
             mae = F.l1_loss(output, target)
@@ -289,13 +181,11 @@ def train(config, train_loader, model, criterion, optimizer, epoch):
         loss.backward()
         optimizer.step()
 
-        # 鏇存柊鎸囨爣
         avg_meters['loss'].update(loss.item(), input.size(0))
         avg_meters['mse'].update(mse.item(), input.size(0))
         avg_meters['mae'].update(mae.item(), input.size(0))
         avg_meters['rmse'].update(rmse.item(), input.size(0))
 
-        # 杩涘害鏉?
         postfix = OrderedDict([
             ('loss', f"{avg_meters['loss'].avg:.6f}"),
             ('mse', f"{avg_meters['mse'].avg:.6f}"),
@@ -315,19 +205,17 @@ def train(config, train_loader, model, criterion, optimizer, epoch):
     }
 
 
-def validate(config, val_loader, model, criterion, epoch):
-    """????????????"""
+def validate(config, val_loader, model, criterion):
+    """Run one validation epoch for the regression objective."""
     device = config['device']
     avg_meters = {
         'loss': AverageMeter(),
         'mse': AverageMeter(),
         'mae': AverageMeter(),
-        'rmse': AverageMeter(),
-        'ssim': AverageMeter()
+        'rmse': AverageMeter()
     }
 
     model.eval()
-    ssim_metric = SSIMLoss(window_size=11, channel=config['num_classes']).to(device)
 
     with torch.no_grad():
         pbar = tqdm(total=len(val_loader), desc='Validation')
@@ -343,32 +231,24 @@ def validate(config, val_loader, model, criterion, epoch):
                 for output_item, weight in zip(outputs, weights):
                     loss += weight * criterion(output_item, target)
                 output = outputs[-1]
-                loss = apply_optional_regularizers(loss, output, target, config, epoch)
             else:
                 output = model(input)
                 loss = criterion(output, target)
-                loss = apply_optional_regularizers(loss, output, target, config, epoch)
 
-            # ?????????
             mse = F.mse_loss(output, target)
             mae = F.l1_loss(output, target)
             rmse = torch.sqrt(mse)
-            ssim = 1.0 - ssim_metric(output, target)
 
-            # ??????
             avg_meters['loss'].update(loss.item(), input.size(0))
             avg_meters['mse'].update(mse.item(), input.size(0))
             avg_meters['mae'].update(mae.item(), input.size(0))
             avg_meters['rmse'].update(rmse.item(), input.size(0))
-            avg_meters['ssim'].update(ssim.item(), input.size(0))
 
-            # ?????
             postfix = OrderedDict([
                 ('val_loss', f"{avg_meters['loss'].avg:.6f}"),
                 ('val_mse', f"{avg_meters['mse'].avg:.6f}"),
                 ('val_mae', f"{avg_meters['mae'].avg:.6f}"),
                 ('val_rmse', f"{avg_meters['rmse'].avg:.6f}"),
-                ('val_ssim', f"{avg_meters['ssim'].avg:.6f}"),
             ])
             pbar.set_postfix(postfix)
             pbar.update(1)
@@ -379,8 +259,7 @@ def validate(config, val_loader, model, criterion, epoch):
         'loss': avg_meters['loss'].avg,
         'mse': avg_meters['mse'].avg,
         'mae': avg_meters['mae'].avg,
-        'rmse': avg_meters['rmse'].avg,
-        'ssim': avg_meters['ssim'].avg
+        'rmse': avg_meters['rmse'].avg
     }
 
 
@@ -391,7 +270,7 @@ def seed_torch(seed=1029):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = True
 
 
@@ -402,7 +281,6 @@ def main():
     exp_name = config.get('name')
     output_dir = config.get('output_dir')
 
-    # 鑷姩鐢熸垚瀹為獙鍚?
     if config['name'] is None:
         if config['loss'] == 'MSE_SSIM':
             config['name'] = 'test3_%s_wDS_Combo' % config['arch']
@@ -425,68 +303,57 @@ def main():
     # TensorBoard writer
     my_writer = SummaryWriter(f'{output_dir}/{exp_name}')
 
-    # GPU璁剧疆
     cudnn.benchmark = True
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if device.type == 'cpu':
-        raise RuntimeError("鉂?GPU涓嶅彲鐢紒")
+        raise RuntimeError("[ERROR] GPU不可用！")
 
     print(f"\n{'=' * 60}")
-    print(f"GPU淇℃伅")
+    print(f"GPU信息")
     print(f"{'=' * 60}")
-    print(f"浣跨敤璁惧: {device}")
-    print(f"GPU鍚嶇О: {torch.cuda.get_device_name(0)}")
-    print(f"GPU鏄惧瓨: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
-    print(f"CUDA鐗堟湰: {torch.version.cuda}")
+    print(f"使用设备: {device}")
+    print(f"GPU名称: {torch.cuda.get_device_name(0)}")
+    print(f"GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
+    print(f"CUDA版本: {torch.version.cuda}")
     print(f"{'=' * 60}\n")
 
     config['device'] = device
 
-    # [淇敼3] 鎹熷け鍑芥暟閫夋嫨閫昏緫
     if config['loss'] == 'MSELoss':
         criterion = nn.MSELoss().to(device)
-        print("鉁?浣跨敤 MSE 鎹熷け (DeepNIS Baseline)")
+        print("[INFO] 使用 MSE 损失 (DeepNIS Baseline)")
     elif config['loss'] == 'MSE_SSIM':
-        criterion = MSE_SSIM_Loss(
-            channel=config['num_classes'],
-            ssim_weight=config['ssim_weight']
-        ).to(device)
-        print("鉁?浣跨敤 MSE + SSIM 缁勫悎鎹熷け (Proposed)")
+        criterion = MSE_SSIM_Loss(channel=config['num_classes']).to(device)
+        print("[INFO] 使用 MSE + SSIM 组合损失 (Proposed)")
     elif config['loss'] == 'L1Loss':
         criterion = nn.L1Loss().to(device)
-        print("鉁?浣跨敤 L1 鎹熷け")
+        print("[INFO] 使用 L1 损失")
     elif config['loss'] == 'SmoothL1Loss':
         criterion = nn.SmoothL1Loss().to(device)
-        print("鉁?浣跨敤 SmoothL1 鎹熷け")
+        print("[INFO] 使用 SmoothL1 损失")
     else:
-        # 榛樿鍥為€€鍒?MSE
         criterion = nn.MSELoss().to(device)
-        print(f"鈿狅笍 鏈瘑鍒殑 Loss: {config['loss']}锛岄粯璁や娇鐢?MSE")
+        print(f"[WARN] 未识别的 Loss: {config['loss']}，默认使用 MSE")
 
-    # 鍒涘缓妯″瀷
-    print("\n鍒涘缓妯″瀷...")
+    print("\n创建模型...")
     model = archs.__dict__[config['arch']](
         config['num_classes'],
         config['input_channels'],
         config['deep_supervision'],
         embed_dims=config['input_list'],
-        no_kan=config['no_kan'],
-        lowres_kan_only=config['lowres_kan_only'],
-        detail_skip=config['detail_skip'],
-        detail_alpha=config['detail_alpha']
+        no_kan=config['no_kan']
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"鉁?妯″瀷鍒涘缓鎴愬姛")
-    print(f"  鎬诲弬鏁伴噺: {total_params / 1e6:.2f}M")
-    print(f"  鍙缁冨弬鏁? {trainable_params / 1e6:.2f}M")
-    print(f"  妯″瀷浣嶇疆: {next(model.parameters()).device}\n")
+    print(f"[INFO] 模型创建成功")
+    print(f"  总参数量: {total_params / 1e6:.2f}M")
+    print(f"  可训练参数: {trainable_params / 1e6:.2f}M")
+    print(f"  模型位置: {next(model.parameters()).device}\n")
 
-    # 鍙傛暟鍒嗙粍锛圞AN灞傜敤涓嶅悓鐨勫涔犵巼锛?
     param_groups = []
     kan_params = []
     other_params = []
@@ -503,7 +370,7 @@ def main():
             'lr': config['kan_lr'],
             'weight_decay': config['kan_weight_decay']
         })
-        print(f"鉁?KAN灞傚弬鏁? {sum(p.numel() for p in kan_params) / 1e6:.2f}M, lr={config['kan_lr']}")
+        print(f"[INFO] KAN层参数: {sum(p.numel() for p in kan_params) / 1e6:.2f}M, lr={config['kan_lr']}")
 
     if len(other_params) > 0:
         param_groups.append({
@@ -511,7 +378,7 @@ def main():
             'lr': config['lr'],
             'weight_decay': config['weight_decay']
         })
-        print(f"鉁?鍏朵粬鍙傛暟: {sum(p.numel() for p in other_params) / 1e6:.2f}M, lr={config['lr']}\n")
+        print(f"[INFO] 其他参数: {sum(p.numel() for p in other_params) / 1e6:.2f}M, lr={config['lr']}\n")
 
     # Optimizer
     if config['optimizer'] == 'Adam':
@@ -543,17 +410,10 @@ def main():
     else:
         raise NotImplementedError
 
-    # 澶囦唤浠ｇ爜
-    backup_dir = os.path.join(output_dir, exp_name, 'code_backup')
-    os.makedirs(backup_dir, exist_ok=True)
-    backup_files = ['train.py', 'archs.py', 'utils.py', 'dataset_e.py', 'kan.py', 'FCS_attention.py']
-    for fname in backup_files:
-        if os.path.exists(fname):
-            shutil.copy2(fname, os.path.join(backup_dir, fname))
-            if fname in ('train.py', 'archs.py'):
-                shutil.copy2(fname, os.path.join(output_dir, exp_name, fname))
+    shutil.copy2(__file__, f'{output_dir}/{exp_name}/')
+    if os.path.exists('archs.py'):
+        shutil.copy2('archs.py', f'{output_dir}/{exp_name}/')
 
-    # 鍔犺浇鏁版嵁闆?
     print("\n" + "=" * 60)
     print("Loading Complex Dataset (Regression)")
     print("=" * 60)
@@ -575,7 +435,6 @@ def main():
     print(f"  Real target: {real_label_path}")
     print(f"  Imag target: {imag_label_path}")
 
-    # 鏁版嵁澧炲己
     train_transform = Compose([
         RandomRotate90(),
         transforms.HorizontalFlip(p=0.5),
@@ -587,7 +446,6 @@ def main():
         Resize(config['input_h'], config['input_w']),
     ])
 
-    # 鍒涘缓瀹屾暣鏁版嵁闆?
     full_dataset = ComplexMatDataset(
         real_img_path=real_img_path,
         imag_img_path=imag_img_path,
@@ -598,22 +456,16 @@ def main():
         normalize_method='z-score'
     )
 
-    # 鍒掑垎璁粌闆嗗拰楠岃瘉闆?
     dataset_size = len(full_dataset)
     indices = list(range(dataset_size))
 
     np.random.seed(config['dataseed'])
     np.random.shuffle(indices)
 
-    # 鍋囪 dataset_size = 2000
-    # Test:  0   - 199   (10%) -> 鐣欑粰 test.py 鐢紝train.py 缁濆涓嶈兘纰帮紒
-    # Val:   200 - 399   (10%) -> 鐢ㄤ簬楠岃瘉
-    # Train: 400 - 1999  (80%) -> 鐢ㄤ簬璁粌
 
     test_split = int(np.floor(0.1 * dataset_size))  # 10%
     val_split = int(np.floor(0.1 * dataset_size))  # 10%
 
-    # 杩欓噷鐨勫垏鐗囬€昏緫闈炲父鍏抽敭锛?
     test_indices = indices[:test_split]  # 0~199
     val_indices = indices[test_split: test_split + val_split]  # 200~399
     train_indices = indices[test_split + val_split:]  # 400~1999
@@ -621,21 +473,15 @@ def main():
     print("\n[Auto-Fix] Calculating normalization stats using Training indices...")
     full_dataset.calculate_normalization_stats(train_indices)
     full_dataset.save_stats(os.path.join(output_dir, exp_name, 'norm_stats.json'))
-    # expose input normalization stats for residual-learning base reconstruction
-    config['inp_real_mean'] = float(full_dataset.inp_real_mean)
-    config['inp_real_std'] = float(full_dataset.inp_real_std)
-    config['inp_imag_mean'] = float(full_dataset.inp_imag_mean)
-    config['inp_imag_std'] = float(full_dataset.inp_imag_std)
 
-    # train.py 鍙渶瑕佺敤鍒?train 鍜?val
     train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
     val_dataset = TransformSubset(full_dataset, val_indices, val_transform)
 
     print(f"\nDataset split (8:1:1):")
     print(f"  Total:      {dataset_size}")
-    print(f"  Training:   {len(train_dataset)} (鐢ㄤ簬璁粌)")
-    print(f"  Validation: {len(val_dataset)} (鐢ㄤ簬鏃╁仠)")
-    print(f"  Test:       {len(test_indices)} (淇濈暀缁?test.py)")
+    print(f"  Training:   {len(train_dataset)} (用于训练)")
+    print(f"  Validation: {len(val_dataset)} (用于早停)")
+    print(f"  Test:       {len(test_indices)} (保留给 test.py)")
 
     # DataLoaders
     train_loader = torch.utils.data.DataLoader(
@@ -656,7 +502,6 @@ def main():
         drop_last=False
     )
 
-    # 璁粌鏃ュ織
     log = OrderedDict([
         ('epoch', []),
         ('lr', []),
@@ -668,94 +513,63 @@ def main():
         ('val_mse', []),
         ('val_mae', []),
         ('val_rmse', []),
-        ('val_ssim', []),
     ])
 
     best_loss = float('inf')
     trigger = 0
 
-    # 璁粌寰幆
     print("\n" + "=" * 60)
-    print("Start training (regression task)")
+    print("开始训练（回归任务）")
     print("=" * 60 + "\n")
 
     best_loss = float('inf')
-    best_loss_mse = float('inf')
-    best_loss_ssim = float('inf')
     best_mae = float('inf')
     best_mse = float('inf')
     best_rmse = float('inf')
-    best_ssim = -float('inf')
-    trigger = 0  # 鏃╁仠璁℃暟鍣?
+    trigger = 0  # Standardized technical note.
     for epoch in range(config['epochs']):
         print(f'\nEpoch [{epoch}/{config["epochs"]}]')
         print('-' * 60)
 
         # Train
-        train_log = train(config, train_loader, model, criterion, optimizer, epoch)
+        train_log = train(config, train_loader, model, criterion, optimizer)
 
         # Validate
-        val_log = validate(config, val_loader, model, criterion, epoch)
-        # 濡傛灉褰撳墠鐨?MAE 姣斿巻鍙叉渶濂界殑杩樺皬锛屽氨鏇存柊鍘嗗彶鏈€濂?
+        val_log = validate(config, val_loader, model, criterion)
         if val_log['mae'] < best_mae: best_mae = val_log['mae']
+        if val_log['mse'] < best_mse: best_mse = val_log['mse']
         if val_log['rmse'] < best_rmse: best_rmse = val_log['rmse']
 
-        improved_mse = False
-        improved_ssim = False
+        if val_log['loss'] < best_loss:
+            print(f"=> [Epoch {epoch}] Saved best model! (val_loss: {val_log['loss']:.6f})")
 
-        if val_log['mse'] < best_mse:
-            best_mse = val_log['mse']
-            best_loss_mse = val_log['loss']
-            improved_mse = True
-            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model_best_mse.pth')
-            print(f"=> [Epoch {epoch}] Saved best-MSE model! (val_mse: {val_log['mse']:.6f})")
+            best_loss = val_log['loss']
 
-        if val_log['ssim'] > best_ssim:
-            best_ssim = val_log['ssim']
-            best_loss_ssim = val_log['loss']
-            improved_ssim = True
-            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model_best_ssim.pth')
-            print(f"=> [Epoch {epoch}] Saved best-SSIM model! (val_ssim: {val_log['ssim']:.6f})")
-
-        if config['early_stop_metric'] == 'mse':
-            improved_main = improved_mse
-            best_loss = best_loss_mse
-        else:
-            improved_main = improved_ssim
-            best_loss = best_loss_ssim
-
-        if improved_main:
             torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
+
             trigger = 0
         else:
             trigger += 1
-            print(f"=> No improvement for {trigger} epochs on val_{config['early_stop_metric']}.")
+            print(f"=> No improvement for {trigger} epochs.")
 
         print(
-            f'   Best Results -> SSIM: {best_ssim:.4f} | Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f}')
+            f'   Best Results -> Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f}')
 
-        # 瑙﹀彂鏃╁仠锛圗arly Stopping锛?
         if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
-            if config['early_stop_metric'] == 'mse':
-                print(f"=> Early stopping triggered! (Best val_mse: {best_mse:.6f})")
-            else:
-                print(f"=> Early stopping triggered! (Best val_ssim: {best_ssim:.6f})")
+            print(f"=> Early stopping triggered! (Best Loss: {best_loss:.6f})")
             break
 
-        # 鏇存柊瀛︿範鐜?
         if config['scheduler'] == 'CosineAnnealingLR':
             scheduler.step()
         elif config['scheduler'] == 'ReduceLROnPlateau':
             scheduler.step(val_log['loss'])
 
-        # 鎵撳嵃缁撴灉
         print(f'\nResults:')
         print(
             f"  Train - Loss: {train_log['loss']:.6f}, MSE: {train_log['mse']:.6f}, MAE: {train_log['mae']:.6f}, RMSE: {train_log['rmse']:.6f}")
         print(
-            f"  Val   - Loss: {val_log['loss']:.6f}, MSE: {val_log['mse']:.6f}, MAE: {val_log['mae']:.6f}, RMSE: {val_log['rmse']:.6f}, SSIM: {val_log['ssim']:.6f}")
+            f"  Val   - Loss: {val_log['loss']:.6f}, MSE: {val_log['mse']:.6f}, MAE: {val_log['mae']:.6f}, RMSE: {val_log['rmse']:.6f}")
 
-        # 璁板綍鏃ュ織
         log['epoch'].append(epoch)
         log['lr'].append(optimizer.param_groups[0]['lr'])
         log['loss'].append(train_log['loss'])
@@ -766,7 +580,6 @@ def main():
         log['val_mse'].append(val_log['mse'])
         log['val_mae'].append(val_log['mae'])
         log['val_rmse'].append(val_log['rmse'])
-        log['val_ssim'].append(val_log['ssim'])
 
         pd.DataFrame(log).to_csv(f'{output_dir}/{exp_name}/log.csv', index=False)
 
@@ -779,9 +592,7 @@ def main():
         my_writer.add_scalar('val/mse', val_log['mse'], epoch)
         my_writer.add_scalar('val/mae', val_log['mae'], epoch)
         my_writer.add_scalar('val/rmse', val_log['rmse'], epoch)
-        my_writer.add_scalar('val/ssim', val_log['ssim'], epoch)
         my_writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
-        my_writer.add_scalar('best/ssim', best_ssim, epoch)
         my_writer.add_scalar('best/loss', best_loss, epoch)
         my_writer.add_scalar('best/mae', best_mae, epoch)
         my_writer.add_scalar('best/mse', best_mse, epoch)
@@ -791,14 +602,13 @@ def main():
         torch.cuda.empty_cache()
 
     print("\n" + "=" * 60)
-    print(f"璁粌瀹屾垚锛佹渶浣抽獙璇佹崯澶? {best_loss:.6f}")
+    print(f"训练完成！最佳验证损失: {best_loss:.6f}")
     print("=" * 60)
 
     my_writer.close()
-    # ================= 淇濆瓨鏈€浣崇粨鏋滃埌 txt 鏂囦欢 =================
     result_path = f'{output_dir}/{exp_name}/best_results.txt'
 
-    print(f"姝ｅ湪淇濆瓨鏈€浣虫寚鏍囧埌: {result_path}")
+    print(f"正在保存最佳指标到: {result_path}")
 
     with open(result_path, 'w', encoding='utf-8') as f:
         f.write("=" * 40 + "\n")
@@ -808,14 +618,13 @@ def main():
 
         f.write("Best Metrics during Training:\n")
         f.write("-" * 30 + "\n")
-        f.write(f"Best SSIM: {best_ssim:.8f}\n")
         f.write(f"Best Loss: {best_loss:.8f}\n")
         f.write(f"Best MSE:  {best_mse:.8f}\n")
         f.write(f"Best MAE:  {best_mae:.8f}\n")
         f.write(f"Best RMSE: {best_rmse:.8f}\n")
         f.write("-" * 30 + "\n")
 
-    print("Results saved.")
+    print("[INFO] 结果已保存")
     # ==============================================================
 
 

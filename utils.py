@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn.functional as F
 import math
 import argparse
@@ -7,11 +7,10 @@ from torch.autograd import Variable
 
 
 # ==========================================================
-#  1. 基础工具类 (AverageMeter, str2bool)
 # ==========================================================
 
 class AverageMeter(object):
-    """计算并存储平均值和当前值"""
+    """Track and update running averages."""
 
     def __init__(self):
         self.reset()
@@ -30,7 +29,7 @@ class AverageMeter(object):
 
 
 def str2bool(v):
-    """用于 argparse 的布尔类型解析"""
+    """Parse boolean values for argparse."""
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
     elif v.lower() in ('no', 'false', 'f', 'n', '0'):
@@ -40,17 +39,16 @@ def str2bool(v):
 
 
 # ==========================================================
-#  2. SSIM Loss 实现 (Differentiable)
 # ==========================================================
 
 def gaussian(window_size, sigma):
-    """生成一维高斯核"""
+    """Generate a one-dimensional Gaussian kernel."""
     gauss = torch.Tensor([math.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
 
 
 def create_window(window_size, channel):
-    """生成二维高斯窗口，用于卷积"""
+    """Generate a two-dimensional Gaussian window for convolution."""
     _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
     _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
     window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
@@ -59,7 +57,7 @@ def create_window(window_size, channel):
 
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
     """
-    SSIM 计算核心逻辑
+    Technical description.
     img1, img2: [Batch, Channel, H, W]
     """
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
@@ -86,7 +84,7 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 
 class SSIMLoss(torch.nn.Module):
     """
-    SSIM 损失函数: Loss = 1 - SSIM
+    Technical description.
     """
 
     def __init__(self, window_size=11, size_average=True, channel=2):
@@ -97,12 +95,10 @@ class SSIMLoss(torch.nn.Module):
         self.window = create_window(window_size, self.channel)
 
     def forward(self, img1, img2):
-        # 确保 window 在正确的 device 上
         if img1.is_cuda:
             self.window = self.window.cuda(img1.get_device())
         self.window = self.window.type_as(img1)
 
-        # 确保通道数匹配 (自动处理如果输入通道变了的情况)
         if self.channel != img1.size(1):
             self.channel = img1.size(1)
             self.window = create_window(self.window_size, self.channel)
@@ -114,28 +110,24 @@ class SSIMLoss(torch.nn.Module):
 
 
 # ==========================================================
-#  3. 其他辅助计算 (Relative Error)
 # ==========================================================
 
 def calc_relative_error(pred, target):
     """
-    计算相对误差 (Relative Error)
+    Technical description.
     RE = ||pred - target||_F / ||target||_F
     """
-    # 确保是 tensor
     if not torch.is_tensor(pred):
         pred = torch.from_numpy(pred)
     if not torch.is_tensor(target):
         target = torch.from_numpy(target)
 
-    # 展平
     pred_flat = pred.view(pred.size(0), -1)
     target_flat = target.view(target.size(0), -1)
 
     diff_norm = torch.norm(pred_flat - target_flat, p=2, dim=1)
     target_norm = torch.norm(target_flat, p=2, dim=1)
 
-    # 防止除以0
     target_norm = torch.where(target_norm < 1e-6, torch.ones_like(target_norm) * 1e-6, target_norm)
 
     re = diff_norm / target_norm

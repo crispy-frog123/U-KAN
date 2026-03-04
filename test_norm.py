@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import os
 import random
 import numpy as np
@@ -10,10 +10,8 @@ from torch.utils.data import DataLoader
 from albumentations.core.composition import Compose
 from albumentations import Resize
 
-# 导入高级评价指标库
 from skimage.metrics import structural_similarity as ssim_func
 
-# 导入项目模块
 import archs
 from dataset_e import ComplexMatDataset, TransformSubset
 from utils import AverageMeter
@@ -32,17 +30,14 @@ def parse_args():
     parser.add_argument('--save_dir', type=str, default='test_results_flexible',
                         help='Directory to save visualization results')
 
-    # [新增可选项]
     parser.add_argument('--new_data_dir', type=str, default=None,
                         help='[Optional] Path to a folder containing NEW dataset .mat files.')
-    parser.add_argument('--tta_rotate', action='store_true',
-                        help='enable 4-way rotation TTA')
 
     return parser.parse_args()
 
 
 def calculate_metrics_detailed(pred, target):
-    """分别计算实部和虚部的 MSE 和 SSIM"""
+    """Compute MSE and SSIM separately for real and imaginary channels."""
     # MSE
     mse_real = np.mean((pred[0] - target[0]) ** 2)
     mse_imag = np.mean((pred[1] - target[1]) ** 2)
@@ -59,33 +54,9 @@ def calculate_metrics_detailed(pred, target):
     return mse_real, mse_imag, ssim_real, ssim_imag
 
 
-def forward_once(model, x):
-    outputs = model(x)
-    return outputs[-1] if isinstance(outputs, list) else outputs
-
-
-def predict_with_tta_rotate(model, x):
-    preds = []
-    for k in [0, 1, 2, 3]:
-        xr = torch.rot90(x, k, dims=[2, 3])
-        yr = forward_once(model, xr)
-        y = torch.rot90(yr, -k, dims=[2, 3])
-        preds.append(y)
-    return torch.stack(preds, dim=0).mean(dim=0)
-
-
-def denorm_input_tensor_for_residual(x, dataset):
-    """Recover raw input from z-score normalized tensor using loaded dataset stats."""
-    base = x.clone()
-    base[:, 0, :, :] = base[:, 0, :, :] * float(dataset.inp_real_std) + float(dataset.inp_real_mean)
-    base[:, 1, :, :] = base[:, 1, :, :] * float(dataset.inp_imag_std) + float(dataset.inp_imag_mean)
-    return base
-
-
 def main():
     args = parse_args()
 
-    # 1. 加载 Config
     config_path = os.path.join(args.exp_dir, 'config.yml')
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found at {config_path}")
@@ -97,10 +68,8 @@ def main():
     print(f"\n{'=' * 60}")
     print(f" Evaluation: {config.get('name', 'Unknown')}")
     print(f" Model Arch: {config['arch']}")
-    print(f" TTA Rotate: {args.tta_rotate}")
     print(f"{'=' * 60}\n")
 
-    # ================= 2. 数据集路径选择逻辑 =================
     print("Configuring Dataset Paths...")
 
     val_transform = Compose([Resize(config['input_h'], config['input_w'])])
@@ -110,8 +79,7 @@ def main():
         return os.path.normpath(os.path.join(base, fname))
 
     if args.new_data_dir is not None:
-        # --- 分支 A: 使用新路径 (New Data Mode) ---
-        print(f"✅ MODE: Using NEW Dataset from: {args.new_data_dir}")
+        print(f"[INFO] MODE: Using NEW Dataset from: {args.new_data_dir}")
         print("   (Assuming filenames are: chi0_all_real_64.mat, etc.)")
 
         path_real_img = os.path.join(args.new_data_dir, 'chi0_all_real_64.mat')
@@ -121,8 +89,7 @@ def main():
 
         use_subset_split = False
     else:
-        # --- 分支 B: 使用 Config 默认路径 (Default Mode) ---
-        print("🔹 MODE: Using CONFIG Dataset (Validation Split)")
+        print("[INFO] MODE: Using CONFIG Dataset (Validation Split)")
 
         path_real_img = build_path(config['data_dir'], config['real_img_file'])
         path_imag_img = build_path(config['data_dir'], config['imag_img_file'])
@@ -133,7 +100,6 @@ def main():
 
         # =========================================================
 
-    # 3. 构建数据集
     if not os.path.exists(path_real_img):
         raise FileNotFoundError(f"Dataset file not found: {path_real_img}")
 
@@ -147,15 +113,13 @@ def main():
         normalize_method='z-score'
     )
 
-    # 4. 加载归一化参数
     stats_path = os.path.join(args.exp_dir, 'norm_stats.json')
     if os.path.exists(stats_path):
         print(f"Loading normalization stats from {stats_path}")
         full_dataset.load_stats(stats_path)
     else:
-        print("⚠️ Warning: norm_stats.json not found! Testing might be inaccurate.")
+        print("[WARN] norm_stats.json not found! Testing might be inaccurate.")
 
-    # 5. 构建 DataLoader
     if use_subset_split:
         indices = list(range(len(full_dataset)))
         np.random.seed(config['dataseed'])
@@ -173,26 +137,20 @@ def main():
 
     test_loader = DataLoader(final_dataset, batch_size=1, shuffle=False)
 
-    # 6. 加载模型
     print(f"Loading Model: {config['arch']}...")
     model = archs.__dict__[config['arch']](
         config['num_classes'],
         config['input_channels'],
         config['deep_supervision'],
         embed_dims=config['input_list'],
-        no_kan=config.get('no_kan', False),
-        use_eca=config.get('use_eca', False),
-        eca_kernel=config.get('eca_kernel', 3),
-        lowres_kan_only=config.get('lowres_kan_only', False),
-        detail_skip=config.get('detail_skip', False),
-        detail_alpha=config.get('detail_alpha', 0.1)
+        no_kan=config.get('no_kan', False)
     ).to(device)
 
     model_path = os.path.join(args.exp_dir, args.checkpoint)
     if not os.path.exists(model_path):
         fallback_path = os.path.join(args.exp_dir, 'model.pth')
         if os.path.exists(fallback_path):
-            print(f"⚠️ {args.checkpoint} not found, using model.pth")
+            print(f"[WARN] {args.checkpoint} not found, using model.pth")
             model_path = fallback_path
         else:
             raise FileNotFoundError(f"No checkpoint found in {args.exp_dir}")
@@ -205,7 +163,6 @@ def main():
         model.load_state_dict(checkpoint)
     model.eval()
 
-    # 7. 测试循环
     meters = {
         'mse_real': AverageMeter(), 'mse_imag': AverageMeter(),
         'ssim_real': AverageMeter(), 'ssim_imag': AverageMeter()
@@ -226,10 +183,11 @@ def main():
             input_tensor = input_tensor.to(device)
             target = target.to(device)
 
-            if args.tta_rotate:
-                pred = predict_with_tta_rotate(model, input_tensor)
+            outputs = model(input_tensor)
+            if isinstance(outputs, list):
+                pred = outputs[-1]
             else:
-                pred = forward_once(model, input_tensor)
+                pred = outputs
 
             pred_np = pred.cpu().numpy().squeeze(0)
             target_np = target.cpu().numpy().squeeze(0)
@@ -250,7 +208,6 @@ def main():
                     'ssim_i': ssim_i
                 })
 
-    # 8. 输出与保存
     print(f"\n{'=' * 20} Final Results {'=' * 20}")
     print(f"Real Part -> MSE: {meters['mse_real'].avg:.6f} | SSIM: {meters['ssim_real'].avg:.4f}")
     print(f"Imag Part -> MSE: {meters['mse_imag'].avg:.6f} | SSIM: {meters['ssim_imag'].avg:.4f}")
@@ -274,45 +231,38 @@ def main():
 
 def plot_samples_abs_bold(samples, save_dir):
     """
-    绘制对比图：
-    1. 虚部 (Imag) 强制取绝对值显示。
-    2. Colorbar 字体加大、加粗。
+    Technical description.
+    Technical description.
+    Technical description.
     """
     num_samples = len(samples)
-    fig, axes = plt.subplots(num_samples, 4, figsize=(20, 4.0 * num_samples))  # 稍微加宽画布
+    fig, axes = plt.subplots(num_samples, 4, figsize=(20, 4.0 * num_samples))  # Standardized technical note.
 
     cols = ['GT Real', 'Pred Real', 'GT |Imag|', 'Pred |Imag|']
     if num_samples == 1: axes = [axes]
 
     for idx, sample in enumerate(samples):
-        # 1. 获取数据
         gt_r = sample['target'][0]
         pd_r = sample['pred'][0]
 
-        # --- 虚部取绝对值 ---
         gt_i = np.abs(sample['target'][1])
         pd_i = np.abs(sample['pred'][1])
         # -------------------
 
-        # 2. 计算动态量程
         vmin_r = min(gt_r.min(), pd_r.min())
         vmax_r = max(gt_r.max(), pd_r.max())
 
-        # 虚部绝对值最小是0
         vmin_i = 0
         vmax_i = max(gt_i.max(), pd_i.max())
 
         row_axes = axes[idx]
 
-        # 设置列标题 (加大字体)
         if idx == 0:
             for ax, col in zip(row_axes, cols):
                 ax.set_title(col, fontsize=16, fontweight='bold', pad=15)
 
-        # 定义画图辅助函数
         def plot_subplot(ax, img, vmin, vmax, cmap='jet'):
             im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
-            # --- Colorbar 加大加粗 ---
             cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.ax.tick_params(labelsize=14)
             for l in cbar.ax.yaxis.get_ticklabels():
@@ -342,7 +292,7 @@ def plot_samples_abs_bold(samples, save_dir):
     plt.tight_layout()
     save_path = os.path.join(save_dir, 'comparison_vis_abs_bold.png')
     plt.savefig(save_path, dpi=300)
-    print(f"✓ Visualization saved to {save_path}")
+    print(f"[INFO] Visualization saved to {save_path}")
 
 
 if __name__ == '__main__':
