@@ -13,6 +13,7 @@ from dataset_e import ComplexMatDataset
 import archs
 from skimage.metrics import structural_similarity as ssim_func
 import json
+import yaml
 
 import warnings
 
@@ -34,6 +35,8 @@ EXP_DIR = 'outputs/2000_[128,160,256]_MSE+0.1SSIM_z-score'
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_dir', type=str, default=EXP_DIR, help='Experiment directory')
+    parser.add_argument('--checkpoint', type=str, default='model_best_mse.pth', help='Checkpoint filename')
+    parser.add_argument('--indices_path', type=str, default=INDICES_PATH, help='Remaining-test indices .mat path')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     return parser.parse_args()
@@ -130,22 +133,41 @@ def save_metrics_to_txt(samples, save_dir, filename="metric.txt"):
         f.write("========================================================\n")
 
 
+def save_overall_metrics_to_txt(metrics, save_dir, filename="overall_metrics.txt"):
+    path = os.path.join(save_dir, filename)
+    print(f"Saving overall metrics to {path}...")
+    with open(path, 'w') as f:
+        f.write("Overall Metrics on Remaining Test Set\n")
+        f.write("====================================\n")
+        f.write(f"Count: {metrics['count']}\n")
+        f.write(f"Real  -> MSE: {metrics['mse_real']:.6f} | SSIM: {metrics['ssim_real']:.4f}\n")
+        f.write(f"Imag  -> MSE: {metrics['mse_imag']:.6f} | SSIM: {metrics['ssim_imag']:.4f}\n")
+        f.write(f"Avg   -> MSE: {metrics['mse_avg']:.6f} | SSIM: {metrics['ssim_avg']:.4f}\n")
+
+
 def test_remaining_fig3_style():
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
     print(f"Running in [Fig.3 Triple Column (Input-GT-Pred)] mode...")
 
-    if not os.path.exists(INDICES_PATH): raise FileNotFoundError(f"Missing indices: {INDICES_PATH}")
-    mat_content = sio.loadmat(INDICES_PATH)
+    if not os.path.exists(args.indices_path):
+        raise FileNotFoundError(f"Missing indices: {args.indices_path}")
+    mat_content = sio.loadmat(args.indices_path)
     test_indices = (mat_content['test_indices'][0] - 1).astype(np.int64)
+
+    cfg_path = os.path.join(args.exp_dir, 'config.yml')
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"Missing config: {cfg_path}")
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
 
     full_dataset = ComplexMatDataset(
         real_img_path=DATA_PATHS['real_img'],
         imag_img_path=DATA_PATHS['imag_img'],
         real_label_path=DATA_PATHS['real_label'],
         imag_label_path=DATA_PATHS['imag_label'],
-        img_size=(64, 64),
+        img_size=(config.get('original_img_size', 64), config.get('original_img_size', 64)),
         normalize_method='z-score'
     )
 
@@ -159,21 +181,45 @@ def test_remaining_fig3_style():
 
     test_subset = Subset(full_dataset, test_indices)
     test_loader = DataLoader(test_subset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    save_dir = os.path.join(args.exp_dir, 'remain_16k')
+    os.makedirs(save_dir, exist_ok=True)
 
-    model = archs.__dict__['UKAN'](num_classes=2, input_channels=2).to(device)
-    ckpt_path = os.path.join(args.exp_dir, 'model.pth')
-    if not os.path.exists(ckpt_path): ckpt_path = os.path.join(args.exp_dir, 'best_model.pth')
+    model = archs.__dict__[config['arch']](
+        num_classes=config.get('num_classes', 2),
+        input_channels=config.get('input_channels', 2),
+        deep_supervision=config.get('deep_supervision', False),
+        embed_dims=config.get('input_list', [128, 160, 256]),
+        no_kan=config.get('no_kan', False),
+        use_edge_residual_refine=config.get('use_edge_residual_refine', False),
+        edge_refine_scale=config.get('edge_refine_scale', 0.2),
+        edge_refine_mid=config.get('edge_refine_mid', 48)
+    ).to(device)
+
+    ckpt_path = os.path.join(args.exp_dir, args.checkpoint)
+    if not os.path.exists(ckpt_path):
+        for cand in ['model.pth', 'model_best_mse.pth', 'model_best_ssim.pth', 'best_model.pth']:
+            cand_path = os.path.join(args.exp_dir, cand)
+            if os.path.exists(cand_path):
+                ckpt_path = cand_path
+                break
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"No checkpoint found in {args.exp_dir}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
     if isinstance(ckpt, dict) and 'state_dict' in ckpt:
-        model.load_state_dict(ckpt['state_dict'], strict=False)
+        model.load_state_dict(ckpt['state_dict'])
     else:
-        model.load_state_dict(ckpt, strict=False)
+        model.load_state_dict(ckpt)
     model.eval()
 
     random.seed(42)
     vis_global_indices = set(random.sample(range(len(test_subset)), 16))
     saved_samples = []
+    sum_ssim_r = 0.0
+    sum_ssim_i = 0.0
+    sum_mse_r = 0.0
+    sum_mse_i = 0.0
+    total_count = 0
 
     print("Start Inference...")
     current_idx = 0
@@ -183,6 +229,8 @@ def test_remaining_fig3_style():
             input_tensor = input_tensor.to(device)
             target = target.to(device)
             output = model(input_tensor)
+            if isinstance(output, list):
+                output = output[-1]
 
             pred_np = output.cpu().numpy()
             target_np = target.cpu().numpy()
@@ -190,9 +238,14 @@ def test_remaining_fig3_style():
 
             for j in range(batch_size):
                 global_id = current_idx + j
-                if global_id in vis_global_indices:
-                    s_r, s_i, m_r, m_i = calculate_detailed_metrics(pred_np[j], target_np[j])
+                s_r, s_i, m_r, m_i = calculate_detailed_metrics(pred_np[j], target_np[j])
+                sum_ssim_r += s_r
+                sum_ssim_i += s_i
+                sum_mse_r += m_r
+                sum_mse_i += m_i
+                total_count += 1
 
+                if global_id in vis_global_indices:
                     input_phys = denormalize_input(input_np[j], norm_stats)
 
                     saved_samples.append({
@@ -204,11 +257,31 @@ def test_remaining_fig3_style():
                         'mse_r': m_r, 'mse_i': m_i
                     })
             current_idx += batch_size
-            if len(saved_samples) >= 16: break
+
+    if total_count == 0:
+        raise RuntimeError("No samples were evaluated.")
+
+    overall = {
+        'count': total_count,
+        'ssim_real': sum_ssim_r / total_count,
+        'ssim_imag': sum_ssim_i / total_count,
+        'mse_real': sum_mse_r / total_count,
+        'mse_imag': sum_mse_i / total_count
+    }
+    overall['ssim_avg'] = 0.5 * (overall['ssim_real'] + overall['ssim_imag'])
+    overall['mse_avg'] = 0.5 * (overall['mse_real'] + overall['mse_imag'])
+
+    print("\n==================== Overall Metrics ====================")
+    print(f"Count: {overall['count']}")
+    print(f"Real  -> MSE: {overall['mse_real']:.6f} | SSIM: {overall['ssim_real']:.4f}")
+    print(f"Imag  -> MSE: {overall['mse_imag']:.6f} | SSIM: {overall['ssim_imag']:.4f}")
+    print(f"Avg   -> MSE: {overall['mse_avg']:.6f} | SSIM: {overall['ssim_avg']:.4f}")
+    print("========================================================")
+    save_overall_metrics_to_txt(overall, save_dir)
 
     if len(saved_samples) == 16:
-        save_metrics_to_txt(saved_samples, args.exp_dir)
-        plot_paper_fig3_style_triple(saved_samples, args.exp_dir)
+        save_metrics_to_txt(saved_samples, save_dir)
+        plot_paper_fig3_style_triple(saved_samples, save_dir)
     else:
         print(f"Error: Need exactly 16 samples, but got {len(saved_samples)}")
 
@@ -290,7 +363,7 @@ def plot_paper_fig3_style_triple(samples, save_dir):
     plt.savefig(save_path_i, dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"[INFO] Results saved:\n  - {save_path_r}\n  - {save_path_i}\n  - metric.txt")
+    print(f"[INFO] Results saved:\n  - {save_path_r}\n  - {save_path_i}\n  - metric.txt\n  - overall_metrics.txt")
 
 
 if __name__ == '__main__':
