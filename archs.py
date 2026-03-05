@@ -296,6 +296,7 @@ class UKAN(nn.Module):
         # Level 1: embed_dims[0] // 4
         # Level 2: embed_dims[0] (bottleneck)
         base_dim = embed_dims[0]
+        self.use_edge_residual_refine = kwargs.get('use_edge_residual_refine', False)
 
         # Encoder normalization layers.
         self.norm0 = norm_layer(base_dim // 8)
@@ -370,11 +371,55 @@ class UKAN(nn.Module):
         # --- Final Head ---
         self.final = nn.Conv2d(base_dim // 8, num_classes, kernel_size=1)
 
+        # Optional edge-aware residual refinement head.
+        if self.use_edge_residual_refine:
+            edge_mid = int(kwargs.get('edge_refine_mid', max(base_dim // 4, 32)))
+            edge_in = input_channels * 2 + num_classes  # [input, sobel(input), base_pred]
+            self.edge_refine_feat = nn.Sequential(
+                nn.Conv2d(edge_in, edge_mid, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(edge_mid),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(edge_mid, edge_mid, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(edge_mid),
+                nn.ReLU(inplace=True),
+            )
+
+            if num_classes == 2:
+                # Decouple real/imag residual prediction to reduce branch interference.
+                self.edge_delta_real = nn.Conv2d(edge_mid, 1, kernel_size=1, bias=True)
+                self.edge_delta_imag = nn.Conv2d(edge_mid, 1, kernel_size=1, bias=True)
+                self.edge_gate_real = nn.Conv2d(edge_mid, 1, kernel_size=1, bias=True)
+                self.edge_gate_imag = nn.Conv2d(edge_mid, 1, kernel_size=1, bias=True)
+            else:
+                self.edge_delta = nn.Conv2d(edge_mid, num_classes, kernel_size=1, bias=True)
+                self.edge_gate = nn.Conv2d(edge_mid, num_classes, kernel_size=1, bias=True)
+
+            init_scale = float(kwargs.get('edge_refine_scale', 0.2))
+            self.edge_refine_scale = nn.Parameter(torch.full((1, num_classes, 1, 1), init_scale, dtype=torch.float32))
+
+            # Fixed Sobel kernels used to expose high-frequency cues.
+            sobel_x = torch.tensor([[-1.0, 0.0, 1.0],
+                                    [-2.0, 0.0, 2.0],
+                                    [-1.0, 0.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3)
+            sobel_y = torch.tensor([[-1.0, -2.0, -1.0],
+                                    [0.0, 0.0, 0.0],
+                                    [1.0, 2.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3)
+            self.register_buffer('sobel_x', sobel_x, persistent=False)
+            self.register_buffer('sobel_y', sobel_y, persistent=False)
+
         # --- Deep Supervision Heads ---
         if self.deep_supervision:
             # Intermediate supervision heads for p2 and p1.
             self.head_p2 = nn.Conv2d(base_dim // 4, num_classes, kernel_size=1)
             self.head_p1 = nn.Conv2d(base_dim // 8, num_classes, kernel_size=1)
+
+    def _sobel_grad_mag(self, x):
+        c = x.shape[1]
+        kx = self.sobel_x.to(dtype=x.dtype).repeat(c, 1, 1, 1)
+        ky = self.sobel_y.to(dtype=x.dtype).repeat(c, 1, 1, 1)
+        gx = F.conv2d(x, kx, padding=1, groups=c)
+        gy = F.conv2d(x, ky, padding=1, groups=c)
+        return torch.sqrt(gx * gx + gy * gy + 1e-12)
 
     def forward(self, x):
         B = x.shape[0]
@@ -453,6 +498,18 @@ class UKAN(nn.Module):
         # Final Convolution
         out = F.relu(F.interpolate(self.decoder5(fusion1), scale_factor=(2, 2), mode='bilinear'))
         final_out = self.final(out)
+        if self.use_edge_residual_refine:
+            grad_x = self._sobel_grad_mag(x)
+            edge_in = torch.cat([x, grad_x, final_out], dim=1)
+            feat = self.edge_refine_feat(edge_in)
+            if self.num_classes == 2:
+                delta = torch.cat([self.edge_delta_real(feat), self.edge_delta_imag(feat)], dim=1)
+                gate = torch.sigmoid(torch.cat([self.edge_gate_real(feat), self.edge_gate_imag(feat)], dim=1))
+            else:
+                delta = self.edge_delta(feat)
+                gate = torch.sigmoid(self.edge_gate(feat))
+            scale = torch.clamp(self.edge_refine_scale, min=0.0, max=1.0).to(dtype=final_out.dtype)
+            final_out = final_out + scale * gate * delta
 
         if self.deep_supervision:
             input_size = x.shape[2:]

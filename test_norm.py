@@ -143,7 +143,10 @@ def main():
         config['input_channels'],
         config['deep_supervision'],
         embed_dims=config['input_list'],
-        no_kan=config.get('no_kan', False)
+        no_kan=config.get('no_kan', False),
+        use_edge_residual_refine=config.get('use_edge_residual_refine', False),
+        edge_refine_scale=config.get('edge_refine_scale', 0.2),
+        edge_refine_mid=config.get('edge_refine_mid', 48)
     ).to(device)
 
     model_path = os.path.join(args.exp_dir, args.checkpoint)

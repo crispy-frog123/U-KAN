@@ -124,9 +124,17 @@ def parse_args():
     parser.add_argument('--gamma', default=2 / 3, type=float)
     parser.add_argument('--early_stopping', default=60, type=int,
                         metavar='N', help='early stopping (default: 60)')
+    parser.add_argument('--early_stop_metric', default='mse', choices=['mse', 'ssim'],
+                        help='metric used for early stopping and model.pth alias')
 
     parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--no_kan', action='store_true')
+    parser.add_argument('--use_edge_residual_refine', default=False, type=str2bool,
+                        help='enable edge-aware residual refinement head')
+    parser.add_argument('--edge_refine_scale', default=0.2, type=float,
+                        help='initial scaling for edge residual refinement')
+    parser.add_argument('--edge_refine_mid', default=48, type=int,
+                        help='hidden channels in edge residual refinement head')
 
     config = parser.parse_args()
 
@@ -212,10 +220,12 @@ def validate(config, val_loader, model, criterion):
         'loss': AverageMeter(),
         'mse': AverageMeter(),
         'mae': AverageMeter(),
-        'rmse': AverageMeter()
+        'rmse': AverageMeter(),
+        'ssim': AverageMeter()
     }
 
     model.eval()
+    ssim_metric = SSIMLoss(window_size=11, channel=config['num_classes']).to(device)
 
     with torch.no_grad():
         pbar = tqdm(total=len(val_loader), desc='Validation')
@@ -238,17 +248,20 @@ def validate(config, val_loader, model, criterion):
             mse = F.mse_loss(output, target)
             mae = F.l1_loss(output, target)
             rmse = torch.sqrt(mse)
+            ssim = 1.0 - ssim_metric(output, target)
 
             avg_meters['loss'].update(loss.item(), input.size(0))
             avg_meters['mse'].update(mse.item(), input.size(0))
             avg_meters['mae'].update(mae.item(), input.size(0))
             avg_meters['rmse'].update(rmse.item(), input.size(0))
+            avg_meters['ssim'].update(ssim.item(), input.size(0))
 
             postfix = OrderedDict([
                 ('val_loss', f"{avg_meters['loss'].avg:.6f}"),
                 ('val_mse', f"{avg_meters['mse'].avg:.6f}"),
                 ('val_mae', f"{avg_meters['mae'].avg:.6f}"),
                 ('val_rmse', f"{avg_meters['rmse'].avg:.6f}"),
+                ('val_ssim', f"{avg_meters['ssim'].avg:.6f}"),
             ])
             pbar.set_postfix(postfix)
             pbar.update(1)
@@ -259,7 +272,8 @@ def validate(config, val_loader, model, criterion):
         'loss': avg_meters['loss'].avg,
         'mse': avg_meters['mse'].avg,
         'mae': avg_meters['mae'].avg,
-        'rmse': avg_meters['rmse'].avg
+        'rmse': avg_meters['rmse'].avg,
+        'ssim': avg_meters['ssim'].avg
     }
 
 
@@ -343,7 +357,10 @@ def main():
         config['input_channels'],
         config['deep_supervision'],
         embed_dims=config['input_list'],
-        no_kan=config['no_kan']
+        no_kan=config['no_kan'],
+        use_edge_residual_refine=config['use_edge_residual_refine'],
+        edge_refine_scale=config['edge_refine_scale'],
+        edge_refine_mid=config['edge_refine_mid']
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -353,6 +370,7 @@ def main():
     print(f"  总参数量: {total_params / 1e6:.2f}M")
     print(f"  可训练参数: {trainable_params / 1e6:.2f}M")
     print(f"  模型位置: {next(model.parameters()).device}\n")
+    print(f"  edge_residual_refine: {config['use_edge_residual_refine']}")
 
     param_groups = []
     kan_params = []
@@ -410,6 +428,12 @@ def main():
     else:
         raise NotImplementedError
 
+    backup_dir = os.path.join(output_dir, exp_name, 'code_backup')
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_files = ['train.py', 'archs.py', 'utils.py', 'dataset_e.py', 'kan.py', 'FCS_attention.py']
+    for fname in backup_files:
+        if os.path.exists(fname):
+            shutil.copy2(fname, os.path.join(backup_dir, fname))
     shutil.copy2(__file__, f'{output_dir}/{exp_name}/')
     if os.path.exists('archs.py'):
         shutil.copy2('archs.py', f'{output_dir}/{exp_name}/')
@@ -513,6 +537,7 @@ def main():
         ('val_mse', []),
         ('val_mae', []),
         ('val_rmse', []),
+        ('val_ssim', []),
     ])
 
     best_loss = float('inf')
@@ -526,6 +551,9 @@ def main():
     best_mae = float('inf')
     best_mse = float('inf')
     best_rmse = float('inf')
+    best_ssim = -float('inf')
+    best_loss_mse = float('inf')
+    best_loss_ssim = float('inf')
     trigger = 0  # Standardized technical note.
     for epoch in range(config['epochs']):
         print(f'\nEpoch [{epoch}/{config["epochs"]}]')
@@ -537,26 +565,47 @@ def main():
         # Validate
         val_log = validate(config, val_loader, model, criterion)
         if val_log['mae'] < best_mae: best_mae = val_log['mae']
-        if val_log['mse'] < best_mse: best_mse = val_log['mse']
         if val_log['rmse'] < best_rmse: best_rmse = val_log['rmse']
+        improved_mse = False
+        improved_ssim = False
 
-        if val_log['loss'] < best_loss:
-            print(f"=> [Epoch {epoch}] Saved best model! (val_loss: {val_log['loss']:.6f})")
+        if val_log['mse'] < best_mse:
+            best_mse = val_log['mse']
+            best_loss_mse = val_log['loss']
+            improved_mse = True
+            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model_best_mse.pth')
+            print(f"=> [Epoch {epoch}] Saved best-MSE model! (val_mse: {val_log['mse']:.6f})")
 
-            best_loss = val_log['loss']
+        if val_log['ssim'] > best_ssim:
+            best_ssim = val_log['ssim']
+            best_loss_ssim = val_log['loss']
+            improved_ssim = True
+            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model_best_ssim.pth')
+            print(f"=> [Epoch {epoch}] Saved best-SSIM model! (val_ssim: {val_log['ssim']:.6f})")
 
+        if config['early_stop_metric'] == 'mse':
+            improved_main = improved_mse
+            best_loss = best_loss_mse
+        else:
+            improved_main = improved_ssim
+            best_loss = best_loss_ssim
+
+        if improved_main:
+            # Keep model.pth aligned with the chosen early-stop metric.
             torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
-
             trigger = 0
         else:
             trigger += 1
-            print(f"=> No improvement for {trigger} epochs.")
+            print(f"=> No improvement for {trigger} epochs on val_{config['early_stop_metric']}.")
 
         print(
-            f'   Best Results -> Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f}')
+            f'   Best Results -> Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f} | SSIM: {best_ssim:.4f}')
 
         if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
-            print(f"=> Early stopping triggered! (Best Loss: {best_loss:.6f})")
+            if config['early_stop_metric'] == 'mse':
+                print(f"=> Early stopping triggered! (Best val_mse: {best_mse:.6f})")
+            else:
+                print(f"=> Early stopping triggered! (Best val_ssim: {best_ssim:.6f})")
             break
 
         if config['scheduler'] == 'CosineAnnealingLR':
@@ -568,7 +617,7 @@ def main():
         print(
             f"  Train - Loss: {train_log['loss']:.6f}, MSE: {train_log['mse']:.6f}, MAE: {train_log['mae']:.6f}, RMSE: {train_log['rmse']:.6f}")
         print(
-            f"  Val   - Loss: {val_log['loss']:.6f}, MSE: {val_log['mse']:.6f}, MAE: {val_log['mae']:.6f}, RMSE: {val_log['rmse']:.6f}")
+            f"  Val   - Loss: {val_log['loss']:.6f}, MSE: {val_log['mse']:.6f}, MAE: {val_log['mae']:.6f}, RMSE: {val_log['rmse']:.6f}, SSIM: {val_log['ssim']:.6f}")
 
         log['epoch'].append(epoch)
         log['lr'].append(optimizer.param_groups[0]['lr'])
@@ -580,6 +629,7 @@ def main():
         log['val_mse'].append(val_log['mse'])
         log['val_mae'].append(val_log['mae'])
         log['val_rmse'].append(val_log['rmse'])
+        log['val_ssim'].append(val_log['ssim'])
 
         pd.DataFrame(log).to_csv(f'{output_dir}/{exp_name}/log.csv', index=False)
 
@@ -592,17 +642,22 @@ def main():
         my_writer.add_scalar('val/mse', val_log['mse'], epoch)
         my_writer.add_scalar('val/mae', val_log['mae'], epoch)
         my_writer.add_scalar('val/rmse', val_log['rmse'], epoch)
+        my_writer.add_scalar('val/ssim', val_log['ssim'], epoch)
         my_writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
         my_writer.add_scalar('best/loss', best_loss, epoch)
         my_writer.add_scalar('best/mae', best_mae, epoch)
         my_writer.add_scalar('best/mse', best_mse, epoch)
         my_writer.add_scalar('best/rmse', best_rmse, epoch)
+        my_writer.add_scalar('best/ssim', best_ssim, epoch)
 
 
         torch.cuda.empty_cache()
 
     print("\n" + "=" * 60)
-    print(f"训练完成！最佳验证损失: {best_loss:.6f}")
+    if config['early_stop_metric'] == 'mse':
+        print(f"训练完成！Best val_mse: {best_mse:.6f}")
+    else:
+        print(f"训练完成！Best val_ssim: {best_ssim:.6f}")
     print("=" * 60)
 
     my_writer.close()
@@ -622,6 +677,7 @@ def main():
         f.write(f"Best MSE:  {best_mse:.8f}\n")
         f.write(f"Best MAE:  {best_mae:.8f}\n")
         f.write(f"Best RMSE: {best_rmse:.8f}\n")
+        f.write(f"Best SSIM: {best_ssim:.8f}\n")
         f.write("-" * 30 + "\n")
 
     print("[INFO] 结果已保存")
