@@ -145,8 +145,28 @@ def main():
         embed_dims=config['input_list'],
         no_kan=config.get('no_kan', False),
         use_edge_residual_refine=config.get('use_edge_residual_refine', False),
+        use_edge_multiscale=config.get('use_edge_multiscale', False),
+        use_edge_sparse_focus=config.get('use_edge_sparse_focus', False),
+        edge_focus_tau=config.get('edge_focus_tau', 0.30),
+        edge_focus_gamma=config.get('edge_focus_gamma', 10.0),
+        use_edge_center_boost=config.get('use_edge_center_boost', False),
+        edge_center_boost=config.get('edge_center_boost', 0.6),
+        edge_center_sigma=config.get('edge_center_sigma', 0.45),
+        use_edge_hotspot_boost=config.get('use_edge_hotspot_boost', False),
+        edge_hotspot_gain=config.get('edge_hotspot_gain', 0.8),
+        edge_hotspot_mu_x=config.get('edge_hotspot_mu_x', -0.08),
+        edge_hotspot_mu_y=config.get('edge_hotspot_mu_y', 0.12),
+        edge_hotspot_sigma_x=config.get('edge_hotspot_sigma_x', 0.45),
+        edge_hotspot_sigma_y=config.get('edge_hotspot_sigma_y', 0.20),
         edge_refine_scale=config.get('edge_refine_scale', 0.2),
-        edge_refine_mid=config.get('edge_refine_mid', 48)
+        edge_refine_mid=config.get('edge_refine_mid', 48),
+        use_detail_skip_refine=config.get('use_detail_skip_refine', False),
+        detail_refine_scale=config.get('detail_refine_scale', 0.1),
+        detail_refine_mid=config.get('detail_refine_mid', 64),
+        use_fourier_refine=config.get('use_fourier_refine', False),
+        fourier_use_fft=config.get('fourier_use_fft', True),
+        fourier_refine_scale=config.get('fourier_refine_scale', 0.1),
+        fourier_refine_mid=config.get('fourier_refine_mid', 32)
     ).to(device)
 
     model_path = os.path.join(args.exp_dir, args.checkpoint)
@@ -161,15 +181,28 @@ def main():
     print(f"Loading weights from: {model_path}")
     checkpoint = torch.load(model_path, map_location=device)
     if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['state_dict'])
+        state = checkpoint['state_dict']
     else:
-        model.load_state_dict(checkpoint)
+        state = checkpoint
+    try:
+        model.load_state_dict(state)
+    except RuntimeError as e:
+        print(f"[WARN] Strict load failed, fallback to strict=False. Reason: {e}")
+        model.load_state_dict(state, strict=False)
     model.eval()
 
     meters = {
         'mse_real': AverageMeter(), 'mse_imag': AverageMeter(),
         'ssim_real': AverageMeter(), 'ssim_imag': AverageMeter()
     }
+
+    # Pixel-level error accumulators for diagnostic analysis.
+    sum_abs_err = None
+    sum_sq_err = None
+    edge_abs_err_sum = 0.0
+    nonedge_abs_err_sum = 0.0
+    edge_count = 0
+    nonedge_count = 0
 
     sub_folder = "results_new_data_abs" if args.new_data_dir else "results_config_data_abs"
     save_full_path = os.path.join(args.exp_dir, sub_folder)
@@ -194,6 +227,36 @@ def main():
 
             pred_np = pred.cpu().numpy().squeeze(0)
             target_np = target.cpu().numpy().squeeze(0)
+
+            abs_err = np.abs(pred_np - target_np)
+            sq_err = (pred_np - target_np) ** 2
+            if sum_abs_err is None:
+                sum_abs_err = np.zeros_like(abs_err, dtype=np.float64)
+                sum_sq_err = np.zeros_like(sq_err, dtype=np.float64)
+            sum_abs_err += abs_err
+            sum_sq_err += sq_err
+
+            # Edge/non-edge error split based on target gradient magnitude.
+            grad = 0.5 * (
+                np.hypot(*np.gradient(target_np[0])) +
+                np.hypot(*np.gradient(target_np[1]))
+            )
+            thr = np.percentile(grad, 80.0)
+            edge_mask = grad > thr
+            if edge_mask.sum() == 0:
+                # Degenerate case when gradients are mostly zero.
+                flat = grad.reshape(-1)
+                k = max(1, int(0.2 * flat.size))
+                topk_idx = np.argpartition(flat, -k)[-k:]
+                edge_mask = np.zeros_like(flat, dtype=bool)
+                edge_mask[topk_idx] = True
+                edge_mask = edge_mask.reshape(grad.shape)
+            nonedge_mask = ~edge_mask
+            per_pixel_abs = abs_err.mean(axis=0)
+            edge_abs_err_sum += float(per_pixel_abs[edge_mask].sum())
+            nonedge_abs_err_sum += float(per_pixel_abs[nonedge_mask].sum())
+            edge_count += int(edge_mask.sum())
+            nonedge_count += int(nonedge_mask.sum())
 
             mse_r, mse_i, ssim_r, ssim_i = calculate_metrics_detailed(pred_np, target_np)
 
@@ -227,6 +290,67 @@ def main():
         f.write(f"Real SSIM: {meters['ssim_real'].avg:.6f}\n")
         f.write(f"Imag SSIM: {meters['ssim_imag'].avg:.6f}\n")
         f.write(f"Avg SSIM:  {(meters['ssim_real'].avg + meters['ssim_imag'].avg) / 2:.6f}\n")
+
+    # Save pixel-wise error diagnostics.
+    sample_count = max(1, len(final_dataset))
+    mean_abs_err = (sum_abs_err / sample_count).astype(np.float32)
+    mean_sq_err = (sum_sq_err / sample_count).astype(np.float32)
+    np.save(os.path.join(save_full_path, 'pixel_mae_map.npy'), mean_abs_err)
+    np.save(os.path.join(save_full_path, 'pixel_mse_map.npy'), mean_sq_err)
+
+    # Max-error coordinates per channel.
+    r_max_idx = np.unravel_index(np.argmax(mean_abs_err[0]), mean_abs_err[0].shape)
+    i_max_idx = np.unravel_index(np.argmax(mean_abs_err[1]), mean_abs_err[1].shape)
+    combined_mae = mean_abs_err.mean(axis=0)
+    topk = 20
+    flat_idx = np.argpartition(combined_mae.ravel(), -topk)[-topk:]
+    flat_idx = flat_idx[np.argsort(combined_mae.ravel()[flat_idx])[::-1]]
+    topk_coords = [np.unravel_index(int(idx), combined_mae.shape) for idx in flat_idx]
+    topk_y = float(np.mean([p[0] for p in topk_coords]))
+    topk_x = float(np.mean([p[1] for p in topk_coords]))
+
+    edge_mae = edge_abs_err_sum / max(1, edge_count)
+    nonedge_mae = nonedge_abs_err_sum / max(1, nonedge_count)
+
+    report_path = os.path.join(save_full_path, 'pixel_error_report.txt')
+    with open(report_path, 'w') as f:
+        f.write("Pixel Error Report\n")
+        f.write("==================\n")
+        f.write(f"Count: {sample_count}\n")
+        f.write(f"Real max MAE: {mean_abs_err[0][r_max_idx]:.6f} at (y={r_max_idx[0]}, x={r_max_idx[1]})\n")
+        f.write(f"Imag max MAE: {mean_abs_err[1][i_max_idx]:.6f} at (y={i_max_idx[0]}, x={i_max_idx[1]})\n")
+        f.write(f"Edge MAE (top20% grad): {edge_mae:.6f}\n")
+        f.write(f"Non-edge MAE: {nonedge_mae:.6f}\n")
+        if nonedge_mae > 0:
+            f.write(f"Edge/Non-edge ratio: {edge_mae / nonedge_mae:.4f}\n")
+        f.write(f"Top-20 mean location: (y={topk_y:.2f}, x={topk_x:.2f})\n")
+        f.write("\nTop-20 combined MAE pixels (y, x, mae):\n")
+        for y, x in topk_coords:
+            f.write(f"({y:02d}, {x:02d}) -> {combined_mae[y, x]:.6f}\n")
+
+    # Heatmap visualization
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    im0 = axes[0].imshow(mean_abs_err[0], cmap='hot')
+    axes[0].set_title('Mean Abs Error (Real)')
+    axes[0].set_xticks([])
+    axes[0].set_yticks([])
+    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    im1 = axes[1].imshow(mean_abs_err[1], cmap='hot')
+    axes[1].set_title('Mean Abs Error (Imag)')
+    axes[1].set_xticks([])
+    axes[1].set_yticks([])
+    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    im2 = axes[2].imshow(combined_mae, cmap='hot')
+    axes[2].set_title('Mean Abs Error (Combined)')
+    axes[2].set_xticks([])
+    axes[2].set_yticks([])
+    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    err_vis_path = os.path.join(save_full_path, 'pixel_mae_heatmap.png')
+    plt.savefig(err_vis_path, dpi=300)
+    plt.close()
+    print(f"[INFO] Pixel error report saved to {report_path}")
+    print(f"[INFO] Pixel error heatmap saved to {err_vis_path}")
 
     print("Plotting samples...")
     plot_samples_abs_bold(saved_samples, save_full_path)

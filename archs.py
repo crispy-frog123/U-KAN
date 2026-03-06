@@ -1,7 +1,8 @@
-﻿import torch
+import torch
 from torch import nn
 import torch.nn.functional as F
 import math
+import warnings
 
 # ------------------------------------------------------
 # Optional timm dependency with compatibility fallback.
@@ -297,6 +298,12 @@ class UKAN(nn.Module):
         # Level 2: embed_dims[0] (bottleneck)
         base_dim = embed_dims[0]
         self.use_edge_residual_refine = kwargs.get('use_edge_residual_refine', False)
+        self.use_edge_multiscale = kwargs.get('use_edge_multiscale', False)
+        self.use_edge_sparse_focus = kwargs.get('use_edge_sparse_focus', False)
+        self.use_edge_center_boost = kwargs.get('use_edge_center_boost', False)
+        self.use_detail_skip_refine = kwargs.get('use_detail_skip_refine', False)
+        self.use_fourier_refine = kwargs.get('use_fourier_refine', False)
+        self.fourier_use_fft = kwargs.get('fourier_use_fft', True)
 
         # Encoder normalization layers.
         self.norm0 = norm_layer(base_dim // 8)
@@ -312,20 +319,21 @@ class UKAN(nn.Module):
         # --- KAN Blocks (Encoder) ---
         # Stage 1
         self.block01 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer)])
+            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer, no_kan=no_kan)])
         # Stage 2
         self.block12 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer)])
+            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer, no_kan=no_kan)])
         # Stage 3 (Bottleneck)
-        self.block23 = nn.ModuleList([KANBlock(dim=base_dim, drop=drop_rate, drop_path=dpr[2], norm_layer=norm_layer)])
+        self.block23 = nn.ModuleList([KANBlock(dim=base_dim, drop=drop_rate, drop_path=dpr[2], norm_layer=norm_layer,
+                                               no_kan=no_kan)])
 
         # --- KAN Blocks (Decoder) ---
         # Decode Stage 2
         self.dblock23 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer)])
+            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer, no_kan=no_kan)])
         # Decode Stage 1
         self.dblock12 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer)])
+            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer, no_kan=no_kan)])
 
         # --- Patch Embed (Encoder Downsampling) ---
         # Stage 1: Input -> Level 0
@@ -371,6 +379,26 @@ class UKAN(nn.Module):
         # --- Final Head ---
         self.final = nn.Conv2d(base_dim // 8, num_classes, kernel_size=1)
 
+        # Optional Fourier-domain refinement on final full-resolution features.
+        if self.use_fourier_refine:
+            freq_mid = int(kwargs.get('fourier_refine_mid', max(base_dim // 4, 32)))
+            freq_in = (base_dim // 8) * 2
+            self.fourier_refine_net = nn.Sequential(
+                nn.Conv2d(freq_in, freq_mid, kernel_size=1, bias=False),
+                nn.BatchNorm2d(freq_mid),
+                nn.GELU(),
+                nn.Conv2d(freq_mid, freq_in, kernel_size=1, bias=False),
+            )
+            self.fourier_fallback_net = nn.Sequential(
+                nn.Conv2d(base_dim // 8, freq_mid, kernel_size=1, bias=False),
+                nn.BatchNorm2d(freq_mid),
+                nn.GELU(),
+                nn.Conv2d(freq_mid, base_dim // 8, kernel_size=1, bias=False),
+            )
+            freq_scale = float(kwargs.get('fourier_refine_scale', 0.1))
+            self.fourier_refine_scale = nn.Parameter(torch.full((1, base_dim // 8, 1, 1), freq_scale, dtype=torch.float32))
+            self._fourier_warned = False
+
         # Optional edge-aware residual refinement head.
         if self.use_edge_residual_refine:
             edge_mid = int(kwargs.get('edge_refine_mid', max(base_dim // 4, 32)))
@@ -383,6 +411,28 @@ class UKAN(nn.Module):
                 nn.BatchNorm2d(edge_mid),
                 nn.ReLU(inplace=True),
             )
+
+            if self.use_edge_multiscale:
+                self.edge_ms_b1 = nn.Sequential(
+                    nn.Conv2d(edge_mid, edge_mid, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(edge_mid),
+                    nn.ReLU(inplace=True),
+                )
+                self.edge_ms_b2 = nn.Sequential(
+                    nn.Conv2d(edge_mid, edge_mid, kernel_size=3, padding=2, dilation=2, bias=False),
+                    nn.BatchNorm2d(edge_mid),
+                    nn.ReLU(inplace=True),
+                )
+                self.edge_ms_b3 = nn.Sequential(
+                    nn.Conv2d(edge_mid, edge_mid, kernel_size=3, padding=3, dilation=3, bias=False),
+                    nn.BatchNorm2d(edge_mid),
+                    nn.ReLU(inplace=True),
+                )
+                self.edge_ms_fuse = nn.Sequential(
+                    nn.Conv2d(edge_mid * 3, edge_mid, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(edge_mid),
+                    nn.ReLU(inplace=True),
+                )
 
             if num_classes == 2:
                 # Decouple real/imag residual prediction to reduce branch interference.
@@ -397,6 +447,18 @@ class UKAN(nn.Module):
             init_scale = float(kwargs.get('edge_refine_scale', 0.2))
             self.edge_refine_scale = nn.Parameter(torch.full((1, num_classes, 1, 1), init_scale, dtype=torch.float32))
 
+            if self.use_edge_center_boost:
+                center_boost = float(kwargs.get('edge_center_boost', 0.6))
+                center_sigma = float(kwargs.get('edge_center_sigma', 0.45))
+                self.edge_center_boost = nn.Parameter(torch.tensor(center_boost, dtype=torch.float32))
+                self.edge_center_sigma = center_sigma
+
+            if self.use_edge_sparse_focus:
+                focus_tau = float(kwargs.get('edge_focus_tau', 0.30))
+                focus_gamma = float(kwargs.get('edge_focus_gamma', 10.0))
+                self.edge_focus_tau = nn.Parameter(torch.tensor(focus_tau, dtype=torch.float32))
+                self.edge_focus_gamma = focus_gamma
+
             # Fixed Sobel kernels used to expose high-frequency cues.
             sobel_x = torch.tensor([[-1.0, 0.0, 1.0],
                                     [-2.0, 0.0, 2.0],
@@ -406,6 +468,39 @@ class UKAN(nn.Module):
                                     [1.0, 2.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3)
             self.register_buffer('sobel_x', sobel_x, persistent=False)
             self.register_buffer('sobel_y', sobel_y, persistent=False)
+
+        # Optional detail skip refinement head for high-frequency recovery.
+        if self.use_detail_skip_refine:
+            detail_mid = int(kwargs.get('detail_refine_mid', max(base_dim // 2, 64)))
+            detail_in = (base_dim // 8) + num_classes + input_channels
+            self.detail_refine_feat = nn.Sequential(
+                nn.Conv2d(detail_in, detail_mid, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(detail_mid),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(detail_mid, detail_mid, kernel_size=3, padding=1, groups=detail_mid, bias=False),
+                nn.BatchNorm2d(detail_mid),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(detail_mid, detail_mid, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(detail_mid),
+                nn.ReLU(inplace=True),
+            )
+
+            if num_classes == 2:
+                self.detail_delta_real = nn.Conv2d(detail_mid, 1, kernel_size=1, bias=True)
+                self.detail_delta_imag = nn.Conv2d(detail_mid, 1, kernel_size=1, bias=True)
+                self.detail_gate_real = nn.Conv2d(detail_mid, 1, kernel_size=1, bias=True)
+                self.detail_gate_imag = nn.Conv2d(detail_mid, 1, kernel_size=1, bias=True)
+            else:
+                self.detail_delta = nn.Conv2d(detail_mid, num_classes, kernel_size=1, bias=True)
+                self.detail_gate = nn.Conv2d(detail_mid, num_classes, kernel_size=1, bias=True)
+
+            detail_scale = float(kwargs.get('detail_refine_scale', 0.1))
+            self.detail_refine_scale = nn.Parameter(torch.full((1, num_classes, 1, 1), detail_scale, dtype=torch.float32))
+
+            lap = torch.tensor([[0.0, -1.0, 0.0],
+                                [-1.0, 4.0, -1.0],
+                                [0.0, -1.0, 0.0]], dtype=torch.float32).view(1, 1, 3, 3)
+            self.register_buffer('lap_kernel', lap, persistent=False)
 
         # --- Deep Supervision Heads ---
         if self.deep_supervision:
@@ -420,6 +515,44 @@ class UKAN(nn.Module):
         gx = F.conv2d(x, kx, padding=1, groups=c)
         gy = F.conv2d(x, ky, padding=1, groups=c)
         return torch.sqrt(gx * gx + gy * gy + 1e-12)
+
+    def _laplacian(self, x):
+        c = x.shape[1]
+        k = self.lap_kernel.to(dtype=x.dtype).repeat(c, 1, 1, 1)
+        return F.conv2d(x, k, padding=1, groups=c)
+
+    def _apply_fourier_refine(self, feat):
+        # Run FFT refinement in FP32 for numerical stability and cast back.
+        feat_dtype = feat.dtype
+        feat_f = feat.float().contiguous()
+        b, c, h, w = feat_f.shape
+        delta_spatial = None
+
+        if self.fourier_use_fft:
+            try:
+                x_fft = torch.fft.rfft2(feat_f, norm='ortho')
+                freq = torch.cat([x_fft.real, x_fft.imag], dim=1)
+                delta_freq = self.fourier_refine_net(freq)
+                d_real, d_imag = torch.chunk(delta_freq, 2, dim=1)
+                delta_complex = torch.complex(d_real, d_imag)
+                delta_spatial = torch.fft.irfft2(delta_complex, s=(h, w), norm='ortho')
+            except RuntimeError as e:
+                if 'CUFFT' in str(e).upper():
+                    if not self._fourier_warned:
+                        warnings.warn(
+                            "cuFFT failed in fourier_refine; fallback to spatial refine.",
+                            RuntimeWarning
+                        )
+                        self._fourier_warned = True
+                else:
+                    raise
+
+        if delta_spatial is None:
+            delta_spatial = self.fourier_fallback_net(feat_f)
+
+        scale = torch.clamp(self.fourier_refine_scale, min=0.0, max=1.0).to(dtype=delta_spatial.dtype)
+        out = feat_f + scale * delta_spatial
+        return out.to(dtype=feat_dtype)
 
     def forward(self, x):
         B = x.shape[0]
@@ -497,11 +630,18 @@ class UKAN(nn.Module):
 
         # Final Convolution
         out = F.relu(F.interpolate(self.decoder5(fusion1), scale_factor=(2, 2), mode='bilinear'))
+        if self.use_fourier_refine:
+            out = self._apply_fourier_refine(out)
         final_out = self.final(out)
         if self.use_edge_residual_refine:
             grad_x = self._sobel_grad_mag(x)
             edge_in = torch.cat([x, grad_x, final_out], dim=1)
             feat = self.edge_refine_feat(edge_in)
+            if self.use_edge_multiscale:
+                f1 = self.edge_ms_b1(feat)
+                f2 = self.edge_ms_b2(feat)
+                f3 = self.edge_ms_b3(feat)
+                feat = self.edge_ms_fuse(torch.cat([f1, f2, f3], dim=1))
             if self.num_classes == 2:
                 delta = torch.cat([self.edge_delta_real(feat), self.edge_delta_imag(feat)], dim=1)
                 gate = torch.sigmoid(torch.cat([self.edge_gate_real(feat), self.edge_gate_imag(feat)], dim=1))
@@ -509,7 +649,38 @@ class UKAN(nn.Module):
                 delta = self.edge_delta(feat)
                 gate = torch.sigmoid(self.edge_gate(feat))
             scale = torch.clamp(self.edge_refine_scale, min=0.0, max=1.0).to(dtype=final_out.dtype)
-            final_out = final_out + scale * gate * delta
+            edge_strength = grad_x.mean(dim=1, keepdim=True)
+            edge_strength = edge_strength / edge_strength.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+            focus = 1.0
+            if self.use_edge_sparse_focus:
+                tau = torch.clamp(self.edge_focus_tau, min=0.0, max=1.0).to(dtype=edge_strength.dtype)
+                focus = torch.sigmoid(self.edge_focus_gamma * (edge_strength - tau))
+            if self.use_edge_center_boost:
+                # Hard-error locations are mostly center-edge pixels in this dataset.
+                # Boost correction where both edge strength and center prior are high.
+                h, w = edge_strength.shape[-2], edge_strength.shape[-1]
+                yy = torch.linspace(-1.0, 1.0, h, device=edge_strength.device, dtype=edge_strength.dtype).view(1, 1, h, 1)
+                xx = torch.linspace(-1.0, 1.0, w, device=edge_strength.device, dtype=edge_strength.dtype).view(1, 1, 1, w)
+                sigma = max(self.edge_center_sigma, 1e-3)
+                center_prior = torch.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
+                boost_gain = torch.clamp(self.edge_center_boost, min=0.0, max=2.0).to(dtype=edge_strength.dtype)
+                boost = 1.0 + boost_gain * center_prior * edge_strength
+                final_out = final_out + scale * boost * focus * gate * delta
+            else:
+                final_out = final_out + scale * focus * gate * delta
+
+        if self.use_detail_skip_refine:
+            lap_x = self._laplacian(x)
+            detail_in = torch.cat([out, final_out, lap_x], dim=1)
+            dfeat = self.detail_refine_feat(detail_in)
+            if self.num_classes == 2:
+                ddelta = torch.cat([self.detail_delta_real(dfeat), self.detail_delta_imag(dfeat)], dim=1)
+                dgate = torch.sigmoid(torch.cat([self.detail_gate_real(dfeat), self.detail_gate_imag(dfeat)], dim=1))
+            else:
+                ddelta = self.detail_delta(dfeat)
+                dgate = torch.sigmoid(self.detail_gate(dfeat))
+            dscale = torch.clamp(self.detail_refine_scale, min=0.0, max=1.0).to(dtype=final_out.dtype)
+            final_out = final_out + dscale * dgate * ddelta
 
         if self.deep_supervision:
             input_size = x.shape[2:]

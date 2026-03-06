@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 from collections import OrderedDict
@@ -14,12 +14,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 
-from albumentations.augmentations import transforms
 from albumentations.core.composition import Compose
 from sklearn.model_selection import train_test_split
 from torch.optim import lr_scheduler
 from tqdm import tqdm
-from albumentations import RandomRotate90, Resize
+from albumentations import RandomRotate90, Resize, HorizontalFlip, VerticalFlip
 
 import archs
 from dataset_e import ComplexMatDataset, TransformSubset
@@ -131,10 +130,38 @@ def parse_args():
     parser.add_argument('--no_kan', action='store_true')
     parser.add_argument('--use_edge_residual_refine', default=False, type=str2bool,
                         help='enable edge-aware residual refinement head')
+    parser.add_argument('--use_edge_multiscale', default=False, type=str2bool,
+                        help='use multi-scale dilated edge context in edge refine')
+    parser.add_argument('--use_edge_sparse_focus', default=False, type=str2bool,
+                        help='focus edge refine on high-gradient sparse regions')
+    parser.add_argument('--edge_focus_tau', default=0.30, type=float,
+                        help='edge focus threshold on normalized gradient')
+    parser.add_argument('--edge_focus_gamma', default=10.0, type=float,
+                        help='edge focus sharpness')
+    parser.add_argument('--use_edge_center_boost', default=False, type=str2bool,
+                        help='boost edge refinement in center-prior hard region')
+    parser.add_argument('--edge_center_boost', default=0.6, type=float,
+                        help='gain for center-edge boost in edge refine')
+    parser.add_argument('--edge_center_sigma', default=0.45, type=float,
+                        help='sigma of center prior map in edge refine boost')
     parser.add_argument('--edge_refine_scale', default=0.2, type=float,
                         help='initial scaling for edge residual refinement')
     parser.add_argument('--edge_refine_mid', default=48, type=int,
                         help='hidden channels in edge residual refinement head')
+    parser.add_argument('--use_detail_skip_refine', default=False, type=str2bool,
+                        help='enable detail skip refinement head for high-frequency recovery')
+    parser.add_argument('--detail_refine_scale', default=0.1, type=float,
+                        help='initial scaling for detail skip refinement')
+    parser.add_argument('--detail_refine_mid', default=64, type=int,
+                        help='hidden channels in detail skip refinement head')
+    parser.add_argument('--use_fourier_refine', default=False, type=str2bool,
+                        help='enable Fourier-domain refinement on final feature map')
+    parser.add_argument('--fourier_use_fft', default=True, type=str2bool,
+                        help='use FFT kernel in fourier refine; disable for unstable CUDA/cuFFT stacks')
+    parser.add_argument('--fourier_refine_scale', default=0.1, type=float,
+                        help='initial scaling for Fourier refinement residual')
+    parser.add_argument('--fourier_refine_mid', default=32, type=int,
+                        help='hidden channels for Fourier refinement MLP')
 
     config = parser.parse_args()
 
@@ -359,8 +386,22 @@ def main():
         embed_dims=config['input_list'],
         no_kan=config['no_kan'],
         use_edge_residual_refine=config['use_edge_residual_refine'],
+        use_edge_multiscale=config['use_edge_multiscale'],
+        use_edge_sparse_focus=config['use_edge_sparse_focus'],
+        edge_focus_tau=config['edge_focus_tau'],
+        edge_focus_gamma=config['edge_focus_gamma'],
+        use_edge_center_boost=config['use_edge_center_boost'],
+        edge_center_boost=config['edge_center_boost'],
+        edge_center_sigma=config['edge_center_sigma'],
         edge_refine_scale=config['edge_refine_scale'],
-        edge_refine_mid=config['edge_refine_mid']
+        edge_refine_mid=config['edge_refine_mid'],
+        use_detail_skip_refine=config['use_detail_skip_refine'],
+        detail_refine_scale=config['detail_refine_scale'],
+        detail_refine_mid=config['detail_refine_mid'],
+        use_fourier_refine=config['use_fourier_refine'],
+        fourier_use_fft=config['fourier_use_fft'],
+        fourier_refine_scale=config['fourier_refine_scale'],
+        fourier_refine_mid=config['fourier_refine_mid']
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -371,6 +412,11 @@ def main():
     print(f"  可训练参数: {trainable_params / 1e6:.2f}M")
     print(f"  模型位置: {next(model.parameters()).device}\n")
     print(f"  edge_residual_refine: {config['use_edge_residual_refine']}")
+    print(f"  edge_multiscale: {config['use_edge_multiscale']}")
+    print(f"  edge_sparse_focus: {config['use_edge_sparse_focus']}")
+    print(f"  edge_center_boost: {config['use_edge_center_boost']}")
+    print(f"  detail_skip_refine: {config['use_detail_skip_refine']}")
+    print(f"  fourier_refine: {config['use_fourier_refine']}")
 
     param_groups = []
     kan_params = []
@@ -461,8 +507,8 @@ def main():
 
     train_transform = Compose([
         RandomRotate90(),
-        transforms.HorizontalFlip(p=0.5),
-        transforms.VerticalFlip(p=0.5),
+        HorizontalFlip(p=0.5),
+        VerticalFlip(p=0.5),
         Resize(config['input_h'], config['input_w']),
     ])
 

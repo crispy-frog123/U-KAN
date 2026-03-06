@@ -191,8 +191,28 @@ def test_remaining_fig3_style():
         embed_dims=config.get('input_list', [128, 160, 256]),
         no_kan=config.get('no_kan', False),
         use_edge_residual_refine=config.get('use_edge_residual_refine', False),
+        use_edge_multiscale=config.get('use_edge_multiscale', False),
+        use_edge_sparse_focus=config.get('use_edge_sparse_focus', False),
+        edge_focus_tau=config.get('edge_focus_tau', 0.30),
+        edge_focus_gamma=config.get('edge_focus_gamma', 10.0),
+        use_edge_center_boost=config.get('use_edge_center_boost', False),
+        edge_center_boost=config.get('edge_center_boost', 0.6),
+        edge_center_sigma=config.get('edge_center_sigma', 0.45),
+        use_edge_hotspot_boost=config.get('use_edge_hotspot_boost', False),
+        edge_hotspot_gain=config.get('edge_hotspot_gain', 0.8),
+        edge_hotspot_mu_x=config.get('edge_hotspot_mu_x', -0.08),
+        edge_hotspot_mu_y=config.get('edge_hotspot_mu_y', 0.12),
+        edge_hotspot_sigma_x=config.get('edge_hotspot_sigma_x', 0.45),
+        edge_hotspot_sigma_y=config.get('edge_hotspot_sigma_y', 0.20),
         edge_refine_scale=config.get('edge_refine_scale', 0.2),
-        edge_refine_mid=config.get('edge_refine_mid', 48)
+        edge_refine_mid=config.get('edge_refine_mid', 48),
+        use_detail_skip_refine=config.get('use_detail_skip_refine', False),
+        detail_refine_scale=config.get('detail_refine_scale', 0.1),
+        detail_refine_mid=config.get('detail_refine_mid', 64),
+        use_fourier_refine=config.get('use_fourier_refine', False),
+        fourier_use_fft=config.get('fourier_use_fft', True),
+        fourier_refine_scale=config.get('fourier_refine_scale', 0.1),
+        fourier_refine_mid=config.get('fourier_refine_mid', 32)
     ).to(device)
 
     ckpt_path = os.path.join(args.exp_dir, args.checkpoint)
@@ -207,9 +227,14 @@ def test_remaining_fig3_style():
 
     ckpt = torch.load(ckpt_path, map_location=device)
     if isinstance(ckpt, dict) and 'state_dict' in ckpt:
-        model.load_state_dict(ckpt['state_dict'])
+        state = ckpt['state_dict']
     else:
-        model.load_state_dict(ckpt)
+        state = ckpt
+    try:
+        model.load_state_dict(state)
+    except RuntimeError as e:
+        print(f"[WARN] Strict load failed, fallback to strict=False. Reason: {e}")
+        model.load_state_dict(state, strict=False)
     model.eval()
 
     random.seed(42)
