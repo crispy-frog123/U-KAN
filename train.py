@@ -2,7 +2,6 @@
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 from collections import OrderedDict
-from glob import glob
 import random
 import numpy as np
 
@@ -15,7 +14,6 @@ import torch.optim as optim
 import yaml
 
 from albumentations.core.composition import Compose
-from sklearn.model_selection import train_test_split
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 from albumentations import RandomRotate90, Resize, HorizontalFlip, VerticalFlip
@@ -67,8 +65,8 @@ def parse_args():
                         help='image height')
     parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
 
-    parser.add_argument('--loss', default='MSELoss',
-                        help='loss function: MSELoss | MSE_SSIM')
+    parser.add_argument('--loss', default='MSE_SSIM',
+                        help='training loss (kept for CLI compatibility)')
 
     parser.add_argument('--data_dir', default='inputs', help='dataset base directory')
 
@@ -96,16 +94,12 @@ def parse_args():
 
     # optimizer
     parser.add_argument('--optimizer', default='Adam',
-                        choices=['Adam', 'SGD'])
+                        help='optimizer (Adam is the supported baseline setting)')
 
     parser.add_argument('--lr', '--learning_rate', default=1e-4, type=float,
                         metavar='LR', help='initial learning rate')
-    parser.add_argument('--momentum', default=0.9, type=float,
-                        help='momentum')
     parser.add_argument('--weight_decay', default=1e-4, type=float,
                         help='weight decay')
-    parser.add_argument('--nesterov', default=False, type=str2bool,
-                        help='nesterov')
 
     parser.add_argument('--kan_lr', default=1e-3, type=float,
                         metavar='LR', help='initial learning rate for KAN layers')
@@ -114,59 +108,42 @@ def parse_args():
 
     # scheduler
     parser.add_argument('--scheduler', default='CosineAnnealingLR',
-                        choices=['CosineAnnealingLR', 'ReduceLROnPlateau', 'MultiStepLR', 'ConstantLR'])
+                        help='scheduler (CosineAnnealingLR is the supported baseline setting)')
     parser.add_argument('--min_lr', default=1e-6, type=float,
                         help='minimum learning rate')
-    parser.add_argument('--factor', default=0.1, type=float)
-    parser.add_argument('--patience', default=5, type=int)
-    parser.add_argument('--milestones', default='1,2', type=str)
-    parser.add_argument('--gamma', default=2 / 3, type=float)
-    parser.add_argument('--early_stopping', default=60, type=int,
-                        metavar='N', help='early stopping (default: 60)')
+    parser.add_argument('--early_stopping', default=-1, type=int,
+                        metavar='N', help='early stopping (-1 disables)')
     parser.add_argument('--early_stop_metric', default='mse', choices=['mse', 'ssim'],
                         help='metric used for early stopping and model.pth alias')
 
     parser.add_argument('--num_workers', default=0, type=int)
-    parser.add_argument('--no_kan', action='store_true')
-    parser.add_argument('--use_edge_residual_refine', default=False, type=str2bool,
+    parser.add_argument('--use_edge_residual_refine', default=True, type=str2bool,
                         help='enable edge-aware residual refinement head')
-    parser.add_argument('--use_edge_multiscale', default=False, type=str2bool,
+    parser.add_argument('--use_edge_multiscale', default=True, type=str2bool,
                         help='use multi-scale dilated edge context in edge refine')
-    parser.add_argument('--use_edge_sparse_focus', default=False, type=str2bool,
+    parser.add_argument('--use_edge_sparse_focus', default=True, type=str2bool,
                         help='focus edge refine on high-gradient sparse regions')
-    parser.add_argument('--edge_focus_tau', default=0.30, type=float,
+    parser.add_argument('--edge_focus_tau', default=0.25, type=float,
                         help='edge focus threshold on normalized gradient')
-    parser.add_argument('--edge_focus_gamma', default=10.0, type=float,
+    parser.add_argument('--edge_focus_gamma', default=12.0, type=float,
                         help='edge focus sharpness')
-    parser.add_argument('--use_edge_center_boost', default=False, type=str2bool,
-                        help='boost edge refinement in center-prior hard region')
-    parser.add_argument('--edge_center_boost', default=0.6, type=float,
-                        help='gain for center-edge boost in edge refine')
-    parser.add_argument('--edge_center_sigma', default=0.45, type=float,
-                        help='sigma of center prior map in edge refine boost')
-    parser.add_argument('--edge_refine_scale', default=0.2, type=float,
+    parser.add_argument('--edge_refine_scale', default=0.25, type=float,
                         help='initial scaling for edge residual refinement')
     parser.add_argument('--edge_refine_mid', default=48, type=int,
                         help='hidden channels in edge residual refinement head')
-    parser.add_argument('--use_detail_skip_refine', default=False, type=str2bool,
-                        help='enable detail skip refinement head for high-frequency recovery')
-    parser.add_argument('--detail_refine_scale', default=0.1, type=float,
-                        help='initial scaling for detail skip refinement')
-    parser.add_argument('--detail_refine_mid', default=64, type=int,
-                        help='hidden channels in detail skip refinement head')
-    parser.add_argument('--use_fourier_refine', default=False, type=str2bool,
+    parser.add_argument('--use_fourier_refine', default=True, type=str2bool,
                         help='enable Fourier-domain refinement on final feature map')
     parser.add_argument('--fourier_use_fft', default=True, type=str2bool,
                         help='use FFT kernel in fourier refine; disable for unstable CUDA/cuFFT stacks')
-    parser.add_argument('--fourier_refine_scale', default=0.1, type=float,
+    parser.add_argument('--fourier_refine_scale', default=0.12, type=float,
                         help='initial scaling for Fourier refinement residual')
-    parser.add_argument('--fourier_refine_mid', default=32, type=int,
+    parser.add_argument('--fourier_refine_mid', default=48, type=int,
                         help='hidden channels for Fourier refinement MLP')
-    parser.add_argument('--use_dual_ri_refine', default=False, type=str2bool,
+    parser.add_argument('--use_dual_ri_refine', default=True, type=str2bool,
                         help='enable decoupled real/imag tail refinement on shared decoder output')
     parser.add_argument('--ri_refine_mid', default=48, type=int,
                         help='hidden channels for dual real/imag tail refinement')
-    parser.add_argument('--ri_refine_scale', default=0.08, type=float,
+    parser.add_argument('--ri_refine_scale', default=0.06, type=float,
                         help='initial residual scaling for dual real/imag tail refinement')
 
     config = parser.parse_args()
@@ -200,7 +177,7 @@ def train(config, train_loader, model, criterion, optimizer):
         input = input.to(device)
         target = target.to(device)
 
-        # Forward
+        # Deep supervision uses fixed weights from the released baseline.
         if config['deep_supervision']:
             outputs = model(input)
             weights = [0.4, 0.4, 1.0]
@@ -355,55 +332,37 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if device.type == 'cpu':
-        raise RuntimeError("[ERROR] GPU不可用！")
+        raise RuntimeError("[ERROR] CUDA device is required for this training script.")
 
     print(f"\n{'=' * 60}")
-    print(f"GPU信息")
+    print("GPU Info")
     print(f"{'=' * 60}")
-    print(f"使用设备: {device}")
-    print(f"GPU名称: {torch.cuda.get_device_name(0)}")
-    print(f"GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
-    print(f"CUDA版本: {torch.version.cuda}")
+    print(f"Device: {device}")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
+    print(f"CUDA: {torch.version.cuda}")
     print(f"{'=' * 60}\n")
 
     config['device'] = device
 
-    if config['loss'] == 'MSELoss':
-        criterion = nn.MSELoss().to(device)
-        print("[INFO] 使用 MSE 损失 (DeepNIS Baseline)")
-    elif config['loss'] == 'MSE_SSIM':
-        criterion = MSE_SSIM_Loss(channel=config['num_classes']).to(device)
-        print("[INFO] 使用 MSE + SSIM 组合损失 (Proposed)")
-    elif config['loss'] == 'L1Loss':
-        criterion = nn.L1Loss().to(device)
-        print("[INFO] 使用 L1 损失")
-    elif config['loss'] == 'SmoothL1Loss':
-        criterion = nn.SmoothL1Loss().to(device)
-        print("[INFO] 使用 SmoothL1 损失")
-    else:
-        criterion = nn.MSELoss().to(device)
-        print(f"[WARN] 未识别的 Loss: {config['loss']}，默认使用 MSE")
+    if config['loss'] != 'MSE_SSIM':
+        raise ValueError(f"Unsupported loss '{config['loss']}'. Use MSE_SSIM for this cleaned baseline.")
+    criterion = MSE_SSIM_Loss(channel=config['num_classes']).to(device)
+    print("[INFO] Loss: MSE + SSIM")
 
-    print("\n创建模型...")
+    print("\nBuilding model...")
     model = archs.__dict__[config['arch']](
         config['num_classes'],
         config['input_channels'],
         config['deep_supervision'],
         embed_dims=config['input_list'],
-        no_kan=config['no_kan'],
         use_edge_residual_refine=config['use_edge_residual_refine'],
         use_edge_multiscale=config['use_edge_multiscale'],
         use_edge_sparse_focus=config['use_edge_sparse_focus'],
         edge_focus_tau=config['edge_focus_tau'],
         edge_focus_gamma=config['edge_focus_gamma'],
-        use_edge_center_boost=config['use_edge_center_boost'],
-        edge_center_boost=config['edge_center_boost'],
-        edge_center_sigma=config['edge_center_sigma'],
         edge_refine_scale=config['edge_refine_scale'],
         edge_refine_mid=config['edge_refine_mid'],
-        use_detail_skip_refine=config['use_detail_skip_refine'],
-        detail_refine_scale=config['detail_refine_scale'],
-        detail_refine_mid=config['detail_refine_mid'],
         use_fourier_refine=config['use_fourier_refine'],
         fourier_use_fft=config['fourier_use_fft'],
         fourier_refine_scale=config['fourier_refine_scale'],
@@ -416,15 +375,13 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"[INFO] 模型创建成功")
-    print(f"  总参数量: {total_params / 1e6:.2f}M")
-    print(f"  可训练参数: {trainable_params / 1e6:.2f}M")
-    print(f"  模型位置: {next(model.parameters()).device}\n")
+    print("[INFO] Model initialized")
+    print(f"  Total params: {total_params / 1e6:.2f}M")
+    print(f"  Trainable params: {trainable_params / 1e6:.2f}M")
+    print(f"  Device: {next(model.parameters()).device}\n")
     print(f"  edge_residual_refine: {config['use_edge_residual_refine']}")
     print(f"  edge_multiscale: {config['use_edge_multiscale']}")
     print(f"  edge_sparse_focus: {config['use_edge_sparse_focus']}")
-    print(f"  edge_center_boost: {config['use_edge_center_boost']}")
-    print(f"  detail_skip_refine: {config['use_detail_skip_refine']}")
     print(f"  fourier_refine: {config['use_fourier_refine']}")
     print(f"  dual_ri_refine: {config['use_dual_ri_refine']}")
 
@@ -444,7 +401,7 @@ def main():
             'lr': config['kan_lr'],
             'weight_decay': config['kan_weight_decay']
         })
-        print(f"[INFO] KAN层参数: {sum(p.numel() for p in kan_params) / 1e6:.2f}M, lr={config['kan_lr']}")
+        print(f"[INFO] KAN params: {sum(p.numel() for p in kan_params) / 1e6:.2f}M, lr={config['kan_lr']}")
 
     if len(other_params) > 0:
         param_groups.append({
@@ -452,37 +409,18 @@ def main():
             'lr': config['lr'],
             'weight_decay': config['weight_decay']
         })
-        print(f"[INFO] 其他参数: {sum(p.numel() for p in other_params) / 1e6:.2f}M, lr={config['lr']}\n")
+        print(f"[INFO] Other params: {sum(p.numel() for p in other_params) / 1e6:.2f}M, lr={config['lr']}\n")
 
-    # Optimizer
-    if config['optimizer'] == 'Adam':
-        optimizer = optim.Adam(param_groups)
-    elif config['optimizer'] == 'SGD':
-        optimizer = optim.SGD(
-            param_groups,
-            momentum=config['momentum'],
-            nesterov=config['nesterov']
+    if config['optimizer'] != 'Adam':
+        raise ValueError(f"Unsupported optimizer '{config['optimizer']}'. Use Adam for this cleaned baseline.")
+    optimizer = optim.Adam(param_groups)
+
+    if config['scheduler'] != 'CosineAnnealingLR':
+        raise ValueError(
+            f"Unsupported scheduler '{config['scheduler']}'. Use CosineAnnealingLR for this cleaned baseline."
         )
-    else:
-        raise NotImplementedError
-
-    # Scheduler
-    if config['scheduler'] == 'CosineAnnealingLR':
-        scheduler = lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config['epochs'], eta_min=config['min_lr'])
-    elif config['scheduler'] == 'ReduceLROnPlateau':
-        scheduler = lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=config['factor'],
-            patience=config['patience'], verbose=True, min_lr=config['min_lr'])
-    elif config['scheduler'] == 'MultiStepLR':
-        scheduler = lr_scheduler.MultiStepLR(
-            optimizer,
-            milestones=[int(e) for e in config['milestones'].split(',')],
-            gamma=config['gamma'])
-    elif config['scheduler'] == 'ConstantLR':
-        scheduler = None
-    else:
-        raise NotImplementedError
+    scheduler = lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config['epochs'], eta_min=config['min_lr'])
 
     backup_dir = os.path.join(output_dir, exp_name, 'code_backup')
     os.makedirs(backup_dir, exist_ok=True)
@@ -559,9 +497,9 @@ def main():
 
     print(f"\nDataset split (8:1:1):")
     print(f"  Total:      {dataset_size}")
-    print(f"  Training:   {len(train_dataset)} (用于训练)")
-    print(f"  Validation: {len(val_dataset)} (用于早停)")
-    print(f"  Test:       {len(test_indices)} (保留给 test.py)")
+    print(f"  Training:   {len(train_dataset)}")
+    print(f"  Validation: {len(val_dataset)}")
+    print(f"  Test:       {len(test_indices)} (reserved for evaluation)")
 
     # DataLoaders
     train_loader = torch.utils.data.DataLoader(
@@ -600,7 +538,7 @@ def main():
     trigger = 0
 
     print("\n" + "=" * 60)
-    print("开始训练（回归任务）")
+    print("Start training (regression)")
     print("=" * 60 + "\n")
 
     best_loss = float('inf')
@@ -664,10 +602,7 @@ def main():
                 print(f"=> Early stopping triggered! (Best val_ssim: {best_ssim:.6f})")
             break
 
-        if config['scheduler'] == 'CosineAnnealingLR':
-            scheduler.step()
-        elif config['scheduler'] == 'ReduceLROnPlateau':
-            scheduler.step(val_log['loss'])
+        scheduler.step()
 
         print(f'\nResults:')
         print(
@@ -711,15 +646,15 @@ def main():
 
     print("\n" + "=" * 60)
     if config['early_stop_metric'] == 'mse':
-        print(f"训练完成！Best val_mse: {best_mse:.6f}")
+        print(f"Training complete. Best val_mse: {best_mse:.6f}")
     else:
-        print(f"训练完成！Best val_ssim: {best_ssim:.6f}")
+        print(f"Training complete. Best val_ssim: {best_ssim:.6f}")
     print("=" * 60)
 
     my_writer.close()
     result_path = f'{output_dir}/{exp_name}/best_results.txt'
 
-    print(f"正在保存最佳指标到: {result_path}")
+    print(f"Writing summary to: {result_path}")
 
     with open(result_path, 'w', encoding='utf-8') as f:
         f.write("=" * 40 + "\n")
@@ -736,7 +671,7 @@ def main():
         f.write(f"Best SSIM: {best_ssim:.8f}\n")
         f.write("-" * 30 + "\n")
 
-    print("[INFO] 结果已保存")
+    print("[INFO] Summary saved")
     # ==============================================================
 
 

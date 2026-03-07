@@ -118,7 +118,7 @@ class DW_bn_relu(nn.Module):
 class KANLayer(nn.Module):
     """Tokenized KAN layer implementing Eq. (6): KAN(Z) = Phi_3(Phi_2(Phi_1(Z)))."""
 
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., no_kan=False):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -132,21 +132,16 @@ class KANLayer(nn.Module):
         grid_eps = 0.02
         grid_range = [-1, 1]
 
-        if not no_kan:
-            # Three-layer KAN stack.
-            self.fc1 = KANLinear(in_features, hidden_features, grid_size=grid_size, spline_order=spline_order,
-                                 scale_noise=scale_noise, scale_base=scale_base, scale_spline=scale_spline,
-                                 base_activation=base_activation, grid_eps=grid_eps, grid_range=grid_range)
-            self.fc2 = KANLinear(hidden_features, out_features, grid_size=grid_size, spline_order=spline_order,
-                                 scale_noise=scale_noise, scale_base=scale_base, scale_spline=scale_spline,
-                                 base_activation=base_activation, grid_eps=grid_eps, grid_range=grid_range)
-            self.fc3 = KANLinear(hidden_features, out_features, grid_size=grid_size, spline_order=spline_order,
-                                 scale_noise=scale_noise, scale_base=scale_base, scale_spline=scale_spline,
-                                 base_activation=base_activation, grid_eps=grid_eps, grid_range=grid_range)
-        else:
-            self.fc1 = nn.Linear(in_features, hidden_features)
-            self.fc2 = nn.Linear(hidden_features, out_features)
-            self.fc3 = nn.Linear(hidden_features, out_features)
+        # Three-layer KAN stack.
+        self.fc1 = KANLinear(in_features, hidden_features, grid_size=grid_size, spline_order=spline_order,
+                             scale_noise=scale_noise, scale_base=scale_base, scale_spline=scale_spline,
+                             base_activation=base_activation, grid_eps=grid_eps, grid_range=grid_range)
+        self.fc2 = KANLinear(hidden_features, out_features, grid_size=grid_size, spline_order=spline_order,
+                             scale_noise=scale_noise, scale_base=scale_base, scale_spline=scale_spline,
+                             base_activation=base_activation, grid_eps=grid_eps, grid_range=grid_range)
+        self.fc3 = KANLinear(hidden_features, out_features, grid_size=grid_size, spline_order=spline_order,
+                             scale_noise=scale_noise, scale_base=scale_base, scale_spline=scale_spline,
+                             base_activation=base_activation, grid_eps=grid_eps, grid_range=grid_range)
 
         # Post-KAN depthwise refinement blocks.
         self.dwconv_1 = DW_bn_relu(hidden_features)
@@ -191,13 +186,12 @@ class KANLayer(nn.Module):
 class KANBlock(nn.Module):
     """Tok-KAN block (Eq. 5) implemented in residual form."""
 
-    def __init__(self, dim, drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, no_kan=False):
+    def __init__(self, dim, drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim)
-        self.layer = KANLayer(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop,
-                              no_kan=no_kan)
+        self.layer = KANLayer(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -284,7 +278,7 @@ class UKAN(nn.Module):
 
     def __init__(self, num_classes, input_channels, deep_supervision=False,
                  img_size=64, patch_size=16,  # Default image size.
-                 embed_dims=[128, 160, 256], no_kan=False,  # Width is primarily determined by embed_dims[0].
+                 embed_dims=[128, 160, 256],  # Width is primarily determined by embed_dims[0].
                  drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
                  depths=[1, 1, 1], **kwargs):  # Depth definition for the three-stage model.
         super().__init__()
@@ -300,9 +294,7 @@ class UKAN(nn.Module):
         self.use_edge_residual_refine = kwargs.get('use_edge_residual_refine', False)
         self.use_edge_multiscale = kwargs.get('use_edge_multiscale', False)
         self.use_edge_sparse_focus = kwargs.get('use_edge_sparse_focus', False)
-        self.use_edge_center_boost = kwargs.get('use_edge_center_boost', False)
         self.use_dual_ri_refine = kwargs.get('use_dual_ri_refine', False)
-        self.use_detail_skip_refine = kwargs.get('use_detail_skip_refine', False)
         self.use_fourier_refine = kwargs.get('use_fourier_refine', False)
         self.fourier_use_fft = kwargs.get('fourier_use_fft', True)
 
@@ -320,21 +312,20 @@ class UKAN(nn.Module):
         # --- KAN Blocks (Encoder) ---
         # Stage 1
         self.block01 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer, no_kan=no_kan)])
+            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer)])
         # Stage 2
         self.block12 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer, no_kan=no_kan)])
+            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer)])
         # Stage 3 (Bottleneck)
-        self.block23 = nn.ModuleList([KANBlock(dim=base_dim, drop=drop_rate, drop_path=dpr[2], norm_layer=norm_layer,
-                                               no_kan=no_kan)])
+        self.block23 = nn.ModuleList([KANBlock(dim=base_dim, drop=drop_rate, drop_path=dpr[2], norm_layer=norm_layer)])
 
         # --- KAN Blocks (Decoder) ---
         # Decode Stage 2
         self.dblock23 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer, no_kan=no_kan)])
+            [KANBlock(dim=base_dim // 4, drop=drop_rate, drop_path=dpr[1], norm_layer=norm_layer)])
         # Decode Stage 1
         self.dblock12 = nn.ModuleList(
-            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer, no_kan=no_kan)])
+            [KANBlock(dim=base_dim // 8, drop=drop_rate, drop_path=dpr[0], norm_layer=norm_layer)])
 
         # --- Patch Embed (Encoder Downsampling) ---
         # Stage 1: Input -> Level 0
@@ -473,12 +464,6 @@ class UKAN(nn.Module):
             init_scale = float(kwargs.get('edge_refine_scale', 0.2))
             self.edge_refine_scale = nn.Parameter(torch.full((1, num_classes, 1, 1), init_scale, dtype=torch.float32))
 
-            if self.use_edge_center_boost:
-                center_boost = float(kwargs.get('edge_center_boost', 0.6))
-                center_sigma = float(kwargs.get('edge_center_sigma', 0.45))
-                self.edge_center_boost = nn.Parameter(torch.tensor(center_boost, dtype=torch.float32))
-                self.edge_center_sigma = center_sigma
-
             if self.use_edge_sparse_focus:
                 focus_tau = float(kwargs.get('edge_focus_tau', 0.30))
                 focus_gamma = float(kwargs.get('edge_focus_gamma', 10.0))
@@ -495,39 +480,6 @@ class UKAN(nn.Module):
             self.register_buffer('sobel_x', sobel_x, persistent=False)
             self.register_buffer('sobel_y', sobel_y, persistent=False)
 
-        # Optional detail skip refinement head for high-frequency recovery.
-        if self.use_detail_skip_refine:
-            detail_mid = int(kwargs.get('detail_refine_mid', max(base_dim // 2, 64)))
-            detail_in = (base_dim // 8) + num_classes + input_channels
-            self.detail_refine_feat = nn.Sequential(
-                nn.Conv2d(detail_in, detail_mid, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(detail_mid),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(detail_mid, detail_mid, kernel_size=3, padding=1, groups=detail_mid, bias=False),
-                nn.BatchNorm2d(detail_mid),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(detail_mid, detail_mid, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(detail_mid),
-                nn.ReLU(inplace=True),
-            )
-
-            if num_classes == 2:
-                self.detail_delta_real = nn.Conv2d(detail_mid, 1, kernel_size=1, bias=True)
-                self.detail_delta_imag = nn.Conv2d(detail_mid, 1, kernel_size=1, bias=True)
-                self.detail_gate_real = nn.Conv2d(detail_mid, 1, kernel_size=1, bias=True)
-                self.detail_gate_imag = nn.Conv2d(detail_mid, 1, kernel_size=1, bias=True)
-            else:
-                self.detail_delta = nn.Conv2d(detail_mid, num_classes, kernel_size=1, bias=True)
-                self.detail_gate = nn.Conv2d(detail_mid, num_classes, kernel_size=1, bias=True)
-
-            detail_scale = float(kwargs.get('detail_refine_scale', 0.1))
-            self.detail_refine_scale = nn.Parameter(torch.full((1, num_classes, 1, 1), detail_scale, dtype=torch.float32))
-
-            lap = torch.tensor([[0.0, -1.0, 0.0],
-                                [-1.0, 4.0, -1.0],
-                                [0.0, -1.0, 0.0]], dtype=torch.float32).view(1, 1, 3, 3)
-            self.register_buffer('lap_kernel', lap, persistent=False)
-
         # --- Deep Supervision Heads ---
         if self.deep_supervision:
             # Intermediate supervision heads for p2 and p1.
@@ -541,11 +493,6 @@ class UKAN(nn.Module):
         gx = F.conv2d(x, kx, padding=1, groups=c)
         gy = F.conv2d(x, ky, padding=1, groups=c)
         return torch.sqrt(gx * gx + gy * gy + 1e-12)
-
-    def _laplacian(self, x):
-        c = x.shape[1]
-        k = self.lap_kernel.to(dtype=x.dtype).repeat(c, 1, 1, 1)
-        return F.conv2d(x, k, padding=1, groups=c)
 
     def _apply_fourier_refine(self, feat):
         # Run FFT refinement in FP32 for numerical stability and cast back.
@@ -692,32 +639,7 @@ class UKAN(nn.Module):
             if self.use_edge_sparse_focus:
                 tau = torch.clamp(self.edge_focus_tau, min=0.0, max=1.0).to(dtype=edge_strength.dtype)
                 focus = torch.sigmoid(self.edge_focus_gamma * (edge_strength - tau))
-            if self.use_edge_center_boost:
-                # Hard-error locations are mostly center-edge pixels in this dataset.
-                # Boost correction where both edge strength and center prior are high.
-                h, w = edge_strength.shape[-2], edge_strength.shape[-1]
-                yy = torch.linspace(-1.0, 1.0, h, device=edge_strength.device, dtype=edge_strength.dtype).view(1, 1, h, 1)
-                xx = torch.linspace(-1.0, 1.0, w, device=edge_strength.device, dtype=edge_strength.dtype).view(1, 1, 1, w)
-                sigma = max(self.edge_center_sigma, 1e-3)
-                center_prior = torch.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
-                boost_gain = torch.clamp(self.edge_center_boost, min=0.0, max=2.0).to(dtype=edge_strength.dtype)
-                boost = 1.0 + boost_gain * center_prior * edge_strength
-                final_out = final_out + scale * boost * focus * gate * delta
-            else:
-                final_out = final_out + scale * focus * gate * delta
-
-        if self.use_detail_skip_refine:
-            lap_x = self._laplacian(x)
-            detail_in = torch.cat([out, final_out, lap_x], dim=1)
-            dfeat = self.detail_refine_feat(detail_in)
-            if self.num_classes == 2:
-                ddelta = torch.cat([self.detail_delta_real(dfeat), self.detail_delta_imag(dfeat)], dim=1)
-                dgate = torch.sigmoid(torch.cat([self.detail_gate_real(dfeat), self.detail_gate_imag(dfeat)], dim=1))
-            else:
-                ddelta = self.detail_delta(dfeat)
-                dgate = torch.sigmoid(self.detail_gate(dfeat))
-            dscale = torch.clamp(self.detail_refine_scale, min=0.0, max=1.0).to(dtype=final_out.dtype)
-            final_out = final_out + dscale * dgate * ddelta
+            final_out = final_out + scale * focus * gate * delta
 
         if self.deep_supervision:
             input_size = x.shape[2:]
