@@ -212,7 +212,10 @@ def test_remaining_fig3_style():
         use_fourier_refine=config.get('use_fourier_refine', False),
         fourier_use_fft=config.get('fourier_use_fft', True),
         fourier_refine_scale=config.get('fourier_refine_scale', 0.1),
-        fourier_refine_mid=config.get('fourier_refine_mid', 32)
+        fourier_refine_mid=config.get('fourier_refine_mid', 32),
+        use_dual_ri_refine=config.get('use_dual_ri_refine', False),
+        ri_refine_mid=config.get('ri_refine_mid', 48),
+        ri_refine_scale=config.get('ri_refine_scale', 0.08)
     ).to(device)
 
     ckpt_path = os.path.join(args.exp_dir, args.checkpoint)

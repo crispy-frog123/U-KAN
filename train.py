@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 from collections import OrderedDict
@@ -162,6 +162,12 @@ def parse_args():
                         help='initial scaling for Fourier refinement residual')
     parser.add_argument('--fourier_refine_mid', default=32, type=int,
                         help='hidden channels for Fourier refinement MLP')
+    parser.add_argument('--use_dual_ri_refine', default=False, type=str2bool,
+                        help='enable decoupled real/imag tail refinement on shared decoder output')
+    parser.add_argument('--ri_refine_mid', default=48, type=int,
+                        help='hidden channels for dual real/imag tail refinement')
+    parser.add_argument('--ri_refine_scale', default=0.08, type=float,
+                        help='initial residual scaling for dual real/imag tail refinement')
 
     config = parser.parse_args()
 
@@ -401,7 +407,10 @@ def main():
         use_fourier_refine=config['use_fourier_refine'],
         fourier_use_fft=config['fourier_use_fft'],
         fourier_refine_scale=config['fourier_refine_scale'],
-        fourier_refine_mid=config['fourier_refine_mid']
+        fourier_refine_mid=config['fourier_refine_mid'],
+        use_dual_ri_refine=config['use_dual_ri_refine'],
+        ri_refine_mid=config['ri_refine_mid'],
+        ri_refine_scale=config['ri_refine_scale']
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -417,6 +426,7 @@ def main():
     print(f"  edge_center_boost: {config['use_edge_center_boost']}")
     print(f"  detail_skip_refine: {config['use_detail_skip_refine']}")
     print(f"  fourier_refine: {config['use_fourier_refine']}")
+    print(f"  dual_ri_refine: {config['use_dual_ri_refine']}")
 
     param_groups = []
     kan_params = []

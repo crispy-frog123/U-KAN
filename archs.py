@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 from torch import nn
 import torch.nn.functional as F
 import math
@@ -301,6 +301,7 @@ class UKAN(nn.Module):
         self.use_edge_multiscale = kwargs.get('use_edge_multiscale', False)
         self.use_edge_sparse_focus = kwargs.get('use_edge_sparse_focus', False)
         self.use_edge_center_boost = kwargs.get('use_edge_center_boost', False)
+        self.use_dual_ri_refine = kwargs.get('use_dual_ri_refine', False)
         self.use_detail_skip_refine = kwargs.get('use_detail_skip_refine', False)
         self.use_fourier_refine = kwargs.get('use_fourier_refine', False)
         self.fourier_use_fft = kwargs.get('fourier_use_fft', True)
@@ -378,6 +379,31 @@ class UKAN(nn.Module):
 
         # --- Final Head ---
         self.final = nn.Conv2d(base_dim // 8, num_classes, kernel_size=1)
+
+        # Optional real/imag split tail refinement on top of shared decoder feature.
+        if self.use_dual_ri_refine and num_classes == 2 and input_channels >= 2:
+            ri_mid = int(kwargs.get('ri_refine_mid', max(base_dim // 4, 32)))
+            ri_in = (base_dim // 8) + 2  # [shared feat, input single-part, base pred single-part]
+            self.ri_refine_real = nn.Sequential(
+                nn.Conv2d(ri_in, ri_mid, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(ri_mid),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(ri_mid, ri_mid, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(ri_mid),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(ri_mid, 1, kernel_size=1, bias=True),
+            )
+            self.ri_refine_imag = nn.Sequential(
+                nn.Conv2d(ri_in, ri_mid, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(ri_mid),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(ri_mid, ri_mid, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(ri_mid),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(ri_mid, 1, kernel_size=1, bias=True),
+            )
+            ri_scale = float(kwargs.get('ri_refine_scale', 0.08))
+            self.ri_refine_scale = nn.Parameter(torch.tensor(ri_scale, dtype=torch.float32))
 
         # Optional Fourier-domain refinement on final full-resolution features.
         if self.use_fourier_refine:
@@ -633,6 +659,17 @@ class UKAN(nn.Module):
         if self.use_fourier_refine:
             out = self._apply_fourier_refine(out)
         final_out = self.final(out)
+        if self.use_dual_ri_refine and self.num_classes == 2 and x.shape[1] >= 2:
+            x_real = x[:, 0:1]
+            x_imag = x[:, 1:2]
+            p_real = final_out[:, 0:1]
+            p_imag = final_out[:, 1:2]
+            ri_in_real = torch.cat([out, x_real, p_real], dim=1)
+            ri_in_imag = torch.cat([out, x_imag, p_imag], dim=1)
+            d_real = self.ri_refine_real(ri_in_real)
+            d_imag = self.ri_refine_imag(ri_in_imag)
+            ri_scale = torch.clamp(self.ri_refine_scale, min=0.0, max=1.0).to(dtype=final_out.dtype)
+            final_out = torch.cat([p_real + ri_scale * d_real, p_imag + ri_scale * d_imag], dim=1)
         if self.use_edge_residual_refine:
             grad_x = self._sobel_grad_mag(x)
             edge_in = torch.cat([x, grad_x, final_out], dim=1)
