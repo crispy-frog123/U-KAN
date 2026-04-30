@@ -1,8 +1,9 @@
-﻿import torch
+"""Utility functions for training and evaluation metrics."""
+
+import torch
 import torch.nn.functional as F
 import math
 import argparse
-import numpy as np
 from torch.autograd import Variable
 
 
@@ -56,9 +57,15 @@ def create_window(window_size, channel):
 
 
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
-    """
-    Technical description.
-    img1, img2: [Batch, Channel, H, W]
+    """Compute SSIM score map between two batched tensors.
+
+    Args:
+        img1: Tensor shaped (N, C, H, W).
+        img2: Tensor shaped (N, C, H, W).
+        window: Gaussian smoothing kernel.
+        window_size: Kernel size.
+        channel: Number of channels.
+        size_average: Whether to average over all dimensions.
     """
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
@@ -83,9 +90,7 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 
 
 class SSIMLoss(torch.nn.Module):
-    """
-    Technical description.
-    """
+    """Differentiable SSIM loss, defined as `1 - SSIM`."""
 
     def __init__(self, window_size=11, size_average=True, channel=2):
         super(SSIMLoss, self).__init__()
@@ -113,8 +118,8 @@ class SSIMLoss(torch.nn.Module):
 # ==========================================================
 
 def calc_relative_error(pred, target):
-    """
-    Technical description.
+    """Compute mean relative Frobenius error.
+
     RE = ||pred - target||_F / ||target||_F
     """
     if not torch.is_tensor(pred):
@@ -132,3 +137,4 @@ def calc_relative_error(pred, target):
 
     re = diff_norm / target_norm
     return re.mean().item()
+

@@ -1,14 +1,13 @@
+"""Frequency/channel/spatial attention blocks used by U-KAN.
+
+This module provides positional attention and multi-spectral DCT attention
+components used in skip/fusion branches of the network.
+"""
+
 import math
 import torch
 import torch.nn as nn
-from timm.models.layers import trunc_normal_
-
-
-
-from torch.nn import Module, Sequential, Conv2d, ReLU,AdaptiveMaxPool2d, AdaptiveAvgPool2d, \
-    NLLLoss, BCELoss, CrossEntropyLoss, AvgPool2d, MaxPool2d, Parameter, Linear, Sigmoid, Softmax, Dropout, Embedding
-from torch.nn import functional as F
-from torch.autograd import Variable
+from torch.nn import Module, Conv2d, Parameter, Softmax
 
 class PAM_Module(Module):
     """Position attention module."""
@@ -46,6 +45,8 @@ class PAM_Module(Module):
 
 
 class DANetHead(nn.Module):
+    """Lightweight decoder head using positional attention."""
+
     def __init__(self, in_channels, out_channels, norm_layer):
         super(DANetHead, self).__init__()
         inter_channels = in_channels // 4
@@ -90,6 +91,8 @@ class DANetHead(nn.Module):
 
 
 def get_freq_indices(method):
+    """Return frequency index pairs for DCT channel attention selection."""
+
     assert method in ['top1', 'top2', 'top4', 'top8', 'top16', 'top32',
                       'bot1', 'bot2', 'bot4', 'bot8', 'bot16', 'bot32',
                       'low1', 'low2', 'low4', 'low8', 'low16', 'low32']
@@ -121,6 +124,8 @@ def get_freq_indices(method):
 
 
 class MultiSpectralAttentionLayer(torch.nn.Module):
+    """Channel attention layer driven by fixed DCT basis projections."""
+
     def __init__(self, channel, dct_h, dct_w, reduction=16, freq_sel_method='top16'):
         super(MultiSpectralAttentionLayer, self).__init__()
         self.reduction = reduction
@@ -209,3 +214,4 @@ class MultiSpectralDCTLayer(nn.Module):
                         t_y, v_y, tile_size_y)
 
         return dct_filter
+

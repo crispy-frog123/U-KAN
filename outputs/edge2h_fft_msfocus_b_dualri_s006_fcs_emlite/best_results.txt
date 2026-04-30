@@ -1,0 +1,13 @@
+========================================
+Experiment: edge2h_fft_msfocus_b_dualri_s006_fcs_emlite
+Finished at Epoch: 400
+========================================
+
+Best Metrics during Training:
+------------------------------
+Best Loss: 0.16291810
+Best MSE:  0.02006462
+Best MAE:  0.03218078
+Best RMSE: 0.14063013
+Best SSIM: 0.89952458
+------------------------------

@@ -1,8 +1,13 @@
-﻿import argparse
+"""Training entrypoint for U-KAN inverse-scattering reconstruction.
+
+This script builds the model, prepares dataset splits, runs train/validation
+loops, and stores checkpoints with run metadata for reproducibility.
+"""
+
+import argparse
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 from collections import OrderedDict
-from glob import glob
 import random
 import numpy as np
 
@@ -14,12 +19,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 
-from albumentations.augmentations import transforms
 from albumentations.core.composition import Compose
-from sklearn.model_selection import train_test_split
 from torch.optim import lr_scheduler
 from tqdm import tqdm
-from albumentations import RandomRotate90, Resize
+from albumentations import RandomRotate90, Resize, HorizontalFlip, VerticalFlip
 
 import archs
 from dataset_e import ComplexMatDataset, TransformSubset
@@ -35,12 +38,14 @@ ARCH_NAMES = archs.__all__
 
 
 def list_type(s):
+    """Parse a comma-separated integer list from CLI input."""
     str_list = s.split(',')
     int_list = [int(a) for a in str_list]
     return int_list
 
 
 def parse_args():
+    """Define and parse command-line arguments for training."""
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--name', default=None,
@@ -68,7 +73,7 @@ def parse_args():
                         help='image height')
     parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
 
-    parser.add_argument('--loss', default='MSELoss',
+    parser.add_argument('--loss', default='MSE_SSIM',
                         help='loss function: MSELoss | MSE_SSIM')
 
     parser.add_argument('--data_dir', default='inputs', help='dataset base directory')
@@ -82,18 +87,10 @@ def parse_args():
     parser.add_argument('--imag_label_file', default='label/chi_all_imag_mnist.mat',
                         help='imaginary part label .mat file')
 
-    parser.add_argument('--img_var_name', default='chi0_all_real',
-                        help='variable name in .mat file for images')
-    parser.add_argument('--label_var_name', default='chi_all_real',
-                        help='variable name in .mat file for labels')
-
     parser.add_argument('--original_img_size', default=64, type=int,
                         help='original image size (H=W)')
 
     parser.add_argument('--output_dir', default='outputs', help='output directory')
-
-    parser.add_argument('--val_split', default=0.2, type=float,
-                        help='validation split ratio')
 
     # optimizer
     parser.add_argument('--optimizer', default='Adam',
@@ -122,17 +119,61 @@ def parse_args():
     parser.add_argument('--patience', default=5, type=int)
     parser.add_argument('--milestones', default='1,2', type=str)
     parser.add_argument('--gamma', default=2 / 3, type=float)
-    parser.add_argument('--early_stopping', default=60, type=int,
+    parser.add_argument('--early_stopping', default=-1, type=int,
                         metavar='N', help='early stopping (default: 60)')
+    parser.add_argument('--early_stop_metric', default='mse', choices=['mse', 'ssim'],
+                        help='metric used for early stopping and model.pth alias')
 
     parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--no_kan', action='store_true')
+    parser.add_argument('--use_edge_residual_refine', default=True, type=str2bool,
+                        help='enable edge-aware residual refinement head')
+    parser.add_argument('--use_edge_multiscale', default=True, type=str2bool,
+                        help='use multi-scale dilated edge context in edge refine')
+    parser.add_argument('--use_edge_sparse_focus', default=True, type=str2bool,
+                        help='focus edge refine on high-gradient sparse regions')
+    parser.add_argument('--edge_focus_tau', default=0.25, type=float,
+                        help='edge focus threshold on normalized gradient')
+    parser.add_argument('--edge_focus_gamma', default=12.0, type=float,
+                        help='edge focus sharpness')
+    parser.add_argument('--use_edge_center_boost', default=False, type=str2bool,
+                        help='boost edge refinement in center-prior hard region')
+    parser.add_argument('--edge_center_boost', default=0.6, type=float,
+                        help='gain for center-edge boost in edge refine')
+    parser.add_argument('--edge_center_sigma', default=0.45, type=float,
+                        help='sigma of center prior map in edge refine boost')
+    parser.add_argument('--edge_refine_scale', default=0.25, type=float,
+                        help='initial scaling for edge residual refinement')
+    parser.add_argument('--edge_refine_mid', default=48, type=int,
+                        help='hidden channels in edge residual refinement head')
+    parser.add_argument('--use_detail_skip_refine', default=False, type=str2bool,
+                        help='enable detail skip refinement head for high-frequency recovery')
+    parser.add_argument('--detail_refine_scale', default=0.1, type=float,
+                        help='initial scaling for detail skip refinement')
+    parser.add_argument('--detail_refine_mid', default=64, type=int,
+                        help='hidden channels in detail skip refinement head')
+    parser.add_argument('--use_fourier_refine', default=True, type=str2bool,
+                        help='enable Fourier-domain refinement on final feature map')
+    parser.add_argument('--fourier_use_fft', default=True, type=str2bool,
+                        help='use FFT kernel in fourier refine; disable for unstable CUDA/cuFFT stacks')
+    parser.add_argument('--fourier_refine_scale', default=0.12, type=float,
+                        help='initial scaling for Fourier refinement residual')
+    parser.add_argument('--fourier_refine_mid', default=48, type=int,
+                        help='hidden channels for Fourier refinement MLP')
+    parser.add_argument('--use_dual_ri_refine', default=True, type=str2bool,
+                        help='enable decoupled real/imag tail refinement on shared decoder output')
+    parser.add_argument('--ri_refine_mid', default=48, type=int,
+                        help='hidden channels for dual real/imag tail refinement')
+    parser.add_argument('--ri_refine_scale', default=0.06, type=float,
+                        help='initial residual scaling for dual real/imag tail refinement')
 
     config = parser.parse_args()
 
     return config
 
 class MSE_SSIM_Loss(nn.Module):
+    """Composite loss defined as MSE + 0.5 * (1 - SSIM)."""
+
     def __init__(self, channel=2):
         super(MSE_SSIM_Loss, self).__init__()
         self.mse = nn.MSELoss()
@@ -212,10 +253,12 @@ def validate(config, val_loader, model, criterion):
         'loss': AverageMeter(),
         'mse': AverageMeter(),
         'mae': AverageMeter(),
-        'rmse': AverageMeter()
+        'rmse': AverageMeter(),
+        'ssim': AverageMeter()
     }
 
     model.eval()
+    ssim_metric = SSIMLoss(window_size=11, channel=config['num_classes']).to(device)
 
     with torch.no_grad():
         pbar = tqdm(total=len(val_loader), desc='Validation')
@@ -238,17 +281,20 @@ def validate(config, val_loader, model, criterion):
             mse = F.mse_loss(output, target)
             mae = F.l1_loss(output, target)
             rmse = torch.sqrt(mse)
+            ssim = 1.0 - ssim_metric(output, target)
 
             avg_meters['loss'].update(loss.item(), input.size(0))
             avg_meters['mse'].update(mse.item(), input.size(0))
             avg_meters['mae'].update(mae.item(), input.size(0))
             avg_meters['rmse'].update(rmse.item(), input.size(0))
+            avg_meters['ssim'].update(ssim.item(), input.size(0))
 
             postfix = OrderedDict([
                 ('val_loss', f"{avg_meters['loss'].avg:.6f}"),
                 ('val_mse', f"{avg_meters['mse'].avg:.6f}"),
                 ('val_mae', f"{avg_meters['mae'].avg:.6f}"),
                 ('val_rmse', f"{avg_meters['rmse'].avg:.6f}"),
+                ('val_ssim', f"{avg_meters['ssim'].avg:.6f}"),
             ])
             pbar.set_postfix(postfix)
             pbar.update(1)
@@ -259,11 +305,13 @@ def validate(config, val_loader, model, criterion):
         'loss': avg_meters['loss'].avg,
         'mse': avg_meters['mse'].avg,
         'mae': avg_meters['mae'].avg,
-        'rmse': avg_meters['rmse'].avg
+        'rmse': avg_meters['rmse'].avg,
+        'ssim': avg_meters['ssim'].avg
     }
 
 
 def seed_torch(seed=1029):
+    """Seed random generators to improve run-to-run reproducibility."""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
@@ -275,6 +323,7 @@ def seed_torch(seed=1029):
 
 
 def main():
+    """Run the full training pipeline and persist artifacts."""
     seed_torch()
     config = vars(parse_args())
 
@@ -308,52 +357,80 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if device.type == 'cpu':
-        raise RuntimeError("[ERROR] GPU不可用！")
+        raise RuntimeError("[ERROR] GPU is not available.")
 
     print(f"\n{'=' * 60}")
-    print(f"GPU信息")
+    print("GPU Info")
     print(f"{'=' * 60}")
-    print(f"使用设备: {device}")
-    print(f"GPU名称: {torch.cuda.get_device_name(0)}")
-    print(f"GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
-    print(f"CUDA版本: {torch.version.cuda}")
+    print(f"Device: {device}")
+    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
+    print(f"CUDA Version: {torch.version.cuda}")
     print(f"{'=' * 60}\n")
 
     config['device'] = device
 
     if config['loss'] == 'MSELoss':
         criterion = nn.MSELoss().to(device)
-        print("[INFO] 使用 MSE 损失 (DeepNIS Baseline)")
+        print("[INFO] Using MSE loss (DeepNIS baseline)")
     elif config['loss'] == 'MSE_SSIM':
         criterion = MSE_SSIM_Loss(channel=config['num_classes']).to(device)
-        print("[INFO] 使用 MSE + SSIM 组合损失 (Proposed)")
+        print("[INFO] Using MSE + SSIM loss (proposed)")
     elif config['loss'] == 'L1Loss':
         criterion = nn.L1Loss().to(device)
-        print("[INFO] 使用 L1 损失")
+        print("[INFO] Using L1 loss")
     elif config['loss'] == 'SmoothL1Loss':
         criterion = nn.SmoothL1Loss().to(device)
-        print("[INFO] 使用 SmoothL1 损失")
+        print("[INFO] Using SmoothL1 loss")
     else:
         criterion = nn.MSELoss().to(device)
-        print(f"[WARN] 未识别的 Loss: {config['loss']}，默认使用 MSE")
+        print(f"[WARN] Unknown loss: {config['loss']}, falling back to MSE")
 
-    print("\n创建模型...")
+    print("\nBuilding model...")
     model = archs.__dict__[config['arch']](
         config['num_classes'],
         config['input_channels'],
         config['deep_supervision'],
         embed_dims=config['input_list'],
-        no_kan=config['no_kan']
+        no_kan=config['no_kan'],
+        use_edge_residual_refine=config['use_edge_residual_refine'],
+        use_edge_multiscale=config['use_edge_multiscale'],
+        use_edge_sparse_focus=config['use_edge_sparse_focus'],
+        edge_focus_tau=config['edge_focus_tau'],
+        edge_focus_gamma=config['edge_focus_gamma'],
+        use_edge_center_boost=config['use_edge_center_boost'],
+        edge_center_boost=config['edge_center_boost'],
+        edge_center_sigma=config['edge_center_sigma'],
+        edge_refine_scale=config['edge_refine_scale'],
+        edge_refine_mid=config['edge_refine_mid'],
+        use_detail_skip_refine=config['use_detail_skip_refine'],
+        detail_refine_scale=config['detail_refine_scale'],
+        detail_refine_mid=config['detail_refine_mid'],
+        use_fourier_refine=config['use_fourier_refine'],
+        fourier_use_fft=config['fourier_use_fft'],
+        fourier_refine_scale=config['fourier_refine_scale'],
+        fourier_refine_mid=config['fourier_refine_mid'],
+        use_dual_ri_refine=config['use_dual_ri_refine'],
+        ri_refine_mid=config['ri_refine_mid'],
+        ri_refine_scale=config['ri_refine_scale']
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"[INFO] 模型创建成功")
-    print(f"  总参数量: {total_params / 1e6:.2f}M")
-    print(f"  可训练参数: {trainable_params / 1e6:.2f}M")
-    print(f"  模型位置: {next(model.parameters()).device}\n")
+    print("[INFO] Model created")
+    print(f"  Total params: {total_params / 1e6:.2f}M")
+    print(f"  Trainable params: {trainable_params / 1e6:.2f}M")
+    print(f"  Model device: {next(model.parameters()).device}\n")
+    print(f"  edge_residual_refine: {config['use_edge_residual_refine']}")
+    print(f"  edge_multiscale: {config['use_edge_multiscale']}")
+    print(f"  edge_sparse_focus: {config['use_edge_sparse_focus']}")
+    print(f"  edge_center_boost: {config['use_edge_center_boost']}")
+    print(f"  detail_skip_refine: {config['use_detail_skip_refine']}")
+    print(f"  fourier_refine: {config['use_fourier_refine']}")
+    print(f"  dual_ri_refine: {config['use_dual_ri_refine']}")
 
+    # Split KAN parameters for separate learning-rate/weight-decay control.
     param_groups = []
     kan_params = []
     other_params = []
@@ -370,7 +447,7 @@ def main():
             'lr': config['kan_lr'],
             'weight_decay': config['kan_weight_decay']
         })
-        print(f"[INFO] KAN层参数: {sum(p.numel() for p in kan_params) / 1e6:.2f}M, lr={config['kan_lr']}")
+        print(f"[INFO] KAN params: {sum(p.numel() for p in kan_params) / 1e6:.2f}M, lr={config['kan_lr']}")
 
     if len(other_params) > 0:
         param_groups.append({
@@ -378,7 +455,7 @@ def main():
             'lr': config['lr'],
             'weight_decay': config['weight_decay']
         })
-        print(f"[INFO] 其他参数: {sum(p.numel() for p in other_params) / 1e6:.2f}M, lr={config['lr']}\n")
+        print(f"[INFO] Other params: {sum(p.numel() for p in other_params) / 1e6:.2f}M, lr={config['lr']}\n")
 
     # Optimizer
     if config['optimizer'] == 'Adam':
@@ -410,12 +487,19 @@ def main():
     else:
         raise NotImplementedError
 
+    # Backup a minimal code snapshot for reproducibility.
+    backup_dir = os.path.join(output_dir, exp_name, 'code_backup')
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_files = ['train.py', 'archs.py', 'utils.py', 'dataset_e.py', 'kan.py', 'FCS_attention.py']
+    for fname in backup_files:
+        if os.path.exists(fname):
+            shutil.copy2(fname, os.path.join(backup_dir, fname))
     shutil.copy2(__file__, f'{output_dir}/{exp_name}/')
     if os.path.exists('archs.py'):
         shutil.copy2('archs.py', f'{output_dir}/{exp_name}/')
 
     print("\n" + "=" * 60)
-    print("Loading Complex Dataset (Regression)")
+    print("Loading complex dataset (regression)")
     print("=" * 60)
 
     def build_path(base_dir, file_path):
@@ -429,7 +513,7 @@ def main():
     real_label_path = build_path(config['data_dir'], config['real_label_file'])
     imag_label_path = build_path(config['data_dir'], config['imag_label_file'])
 
-    print(f"\nData files:")
+    print("\nData files:")
     print(f"  Real image:  {real_img_path}")
     print(f"  Imag image:  {imag_img_path}")
     print(f"  Real target: {real_label_path}")
@@ -437,8 +521,8 @@ def main():
 
     train_transform = Compose([
         RandomRotate90(),
-        transforms.HorizontalFlip(p=0.5),
-        transforms.VerticalFlip(p=0.5),
+        HorizontalFlip(p=0.5),
+        VerticalFlip(p=0.5),
         Resize(config['input_h'], config['input_w']),
     ])
 
@@ -463,6 +547,7 @@ def main():
     np.random.shuffle(indices)
 
 
+    # Fixed 8:1:1 split for train/val/test.
     test_split = int(np.floor(0.1 * dataset_size))  # 10%
     val_split = int(np.floor(0.1 * dataset_size))  # 10%
 
@@ -477,11 +562,11 @@ def main():
     train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
     val_dataset = TransformSubset(full_dataset, val_indices, val_transform)
 
-    print(f"\nDataset split (8:1:1):")
+    print("\nDataset split (8:1:1):")
     print(f"  Total:      {dataset_size}")
-    print(f"  Training:   {len(train_dataset)} (用于训练)")
-    print(f"  Validation: {len(val_dataset)} (用于早停)")
-    print(f"  Test:       {len(test_indices)} (保留给 test.py)")
+    print(f"  Training:   {len(train_dataset)} (train)")
+    print(f"  Validation: {len(val_dataset)} (early stop)")
+    print(f"  Test:       {len(test_indices)} (reserved for test.py)")
 
     # DataLoaders
     train_loader = torch.utils.data.DataLoader(
@@ -513,19 +598,20 @@ def main():
         ('val_mse', []),
         ('val_mae', []),
         ('val_rmse', []),
+        ('val_ssim', []),
     ])
 
-    best_loss = float('inf')
-    trigger = 0
-
     print("\n" + "=" * 60)
-    print("开始训练（回归任务）")
+    print("Start training (regression)")
     print("=" * 60 + "\n")
 
     best_loss = float('inf')
     best_mae = float('inf')
     best_mse = float('inf')
     best_rmse = float('inf')
+    best_ssim = -float('inf')
+    best_loss_mse = float('inf')
+    best_loss_ssim = float('inf')
     trigger = 0  # Standardized technical note.
     for epoch in range(config['epochs']):
         print(f'\nEpoch [{epoch}/{config["epochs"]}]')
@@ -537,26 +623,47 @@ def main():
         # Validate
         val_log = validate(config, val_loader, model, criterion)
         if val_log['mae'] < best_mae: best_mae = val_log['mae']
-        if val_log['mse'] < best_mse: best_mse = val_log['mse']
         if val_log['rmse'] < best_rmse: best_rmse = val_log['rmse']
+        improved_mse = False
+        improved_ssim = False
 
-        if val_log['loss'] < best_loss:
-            print(f"=> [Epoch {epoch}] Saved best model! (val_loss: {val_log['loss']:.6f})")
+        if val_log['mse'] < best_mse:
+            best_mse = val_log['mse']
+            best_loss_mse = val_log['loss']
+            improved_mse = True
+            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model_best_mse.pth')
+            print(f"=> [Epoch {epoch}] Saved best-MSE model! (val_mse: {val_log['mse']:.6f})")
 
-            best_loss = val_log['loss']
+        if val_log['ssim'] > best_ssim:
+            best_ssim = val_log['ssim']
+            best_loss_ssim = val_log['loss']
+            improved_ssim = True
+            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model_best_ssim.pth')
+            print(f"=> [Epoch {epoch}] Saved best-SSIM model! (val_ssim: {val_log['ssim']:.6f})")
 
+        if config['early_stop_metric'] == 'mse':
+            improved_main = improved_mse
+            best_loss = best_loss_mse
+        else:
+            improved_main = improved_ssim
+            best_loss = best_loss_ssim
+
+        if improved_main:
+            # Keep model.pth aligned with the chosen early-stop metric.
             torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
-
             trigger = 0
         else:
             trigger += 1
-            print(f"=> No improvement for {trigger} epochs.")
+            print(f"=> No improvement for {trigger} epochs on val_{config['early_stop_metric']}.")
 
         print(
-            f'   Best Results -> Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f}')
+            f'   Best Results -> Loss: {best_loss:.4f} | MAE: {best_mae:.4f} | MSE: {best_mse:.4f} | RMSE: {best_rmse:.4f} | SSIM: {best_ssim:.4f}')
 
         if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
-            print(f"=> Early stopping triggered! (Best Loss: {best_loss:.6f})")
+            if config['early_stop_metric'] == 'mse':
+                print(f"=> Early stopping triggered! (Best val_mse: {best_mse:.6f})")
+            else:
+                print(f"=> Early stopping triggered! (Best val_ssim: {best_ssim:.6f})")
             break
 
         if config['scheduler'] == 'CosineAnnealingLR':
@@ -564,11 +671,11 @@ def main():
         elif config['scheduler'] == 'ReduceLROnPlateau':
             scheduler.step(val_log['loss'])
 
-        print(f'\nResults:')
+        print('\nResults:')
         print(
             f"  Train - Loss: {train_log['loss']:.6f}, MSE: {train_log['mse']:.6f}, MAE: {train_log['mae']:.6f}, RMSE: {train_log['rmse']:.6f}")
         print(
-            f"  Val   - Loss: {val_log['loss']:.6f}, MSE: {val_log['mse']:.6f}, MAE: {val_log['mae']:.6f}, RMSE: {val_log['rmse']:.6f}")
+            f"  Val   - Loss: {val_log['loss']:.6f}, MSE: {val_log['mse']:.6f}, MAE: {val_log['mae']:.6f}, RMSE: {val_log['rmse']:.6f}, SSIM: {val_log['ssim']:.6f}")
 
         log['epoch'].append(epoch)
         log['lr'].append(optimizer.param_groups[0]['lr'])
@@ -580,6 +687,7 @@ def main():
         log['val_mse'].append(val_log['mse'])
         log['val_mae'].append(val_log['mae'])
         log['val_rmse'].append(val_log['rmse'])
+        log['val_ssim'].append(val_log['ssim'])
 
         pd.DataFrame(log).to_csv(f'{output_dir}/{exp_name}/log.csv', index=False)
 
@@ -592,23 +700,28 @@ def main():
         my_writer.add_scalar('val/mse', val_log['mse'], epoch)
         my_writer.add_scalar('val/mae', val_log['mae'], epoch)
         my_writer.add_scalar('val/rmse', val_log['rmse'], epoch)
+        my_writer.add_scalar('val/ssim', val_log['ssim'], epoch)
         my_writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
         my_writer.add_scalar('best/loss', best_loss, epoch)
         my_writer.add_scalar('best/mae', best_mae, epoch)
         my_writer.add_scalar('best/mse', best_mse, epoch)
         my_writer.add_scalar('best/rmse', best_rmse, epoch)
+        my_writer.add_scalar('best/ssim', best_ssim, epoch)
 
 
         torch.cuda.empty_cache()
 
     print("\n" + "=" * 60)
-    print(f"训练完成！最佳验证损失: {best_loss:.6f}")
+    if config['early_stop_metric'] == 'mse':
+        print(f"Training finished. Best val_mse: {best_mse:.6f}")
+    else:
+        print(f"Training finished. Best val_ssim: {best_ssim:.6f}")
     print("=" * 60)
 
     my_writer.close()
     result_path = f'{output_dir}/{exp_name}/best_results.txt'
 
-    print(f"正在保存最佳指标到: {result_path}")
+    print(f"Saving best metrics to: {result_path}")
 
     with open(result_path, 'w', encoding='utf-8') as f:
         f.write("=" * 40 + "\n")
@@ -622,11 +735,13 @@ def main():
         f.write(f"Best MSE:  {best_mse:.8f}\n")
         f.write(f"Best MAE:  {best_mae:.8f}\n")
         f.write(f"Best RMSE: {best_rmse:.8f}\n")
+        f.write(f"Best SSIM: {best_ssim:.8f}\n")
         f.write("-" * 30 + "\n")
 
-    print("[INFO] 结果已保存")
+    print("[INFO] Results saved")
     # ==============================================================
 
 
 if __name__ == '__main__':
     main()
+

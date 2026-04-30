@@ -1,3 +1,9 @@
+"""Dataset utilities for complex-valued inverse-scattering data.
+
+The dataset loader reads real/imaginary inputs and labels from MAT files and
+applies z-score normalization to inputs while keeping labels in physical scale.
+"""
+
 import os
 import json
 import torch
@@ -8,6 +14,8 @@ from torch.utils.data import Dataset
 
 
 class ComplexMatDataset(Dataset):
+    """PyTorch dataset for paired real/imaginary input-label MAT tensors."""
+
     def __init__(self, real_img_path, imag_img_path, real_label_path, imag_label_path,
                  img_size=(64, 64), transform=None, normalize_method='z-score'):
         """
@@ -88,7 +96,7 @@ class ComplexMatDataset(Dataset):
         self.stats_calculated = True
         print(f"  [Input Real] Mean: {self.inp_real_mean:.4f}, Std: {self.inp_real_std:.4f}")
         print(f"  [Input Imag] Mean: {self.inp_imag_mean:.4f}, Std: {self.inp_imag_std:.4f}")
-        print(f"  [Label] skipped (keeping raw values for physics consistency).")
+        print("  [Label] skipped (keeping raw values for physics consistency).")
 
     def save_stats(self, save_path):
         """Persist input statistics to JSON for reproducible evaluation."""

@@ -1,0 +1,12 @@
+Evaluation Report
+=================
+Data Mode: config_test10
+Real Only: False
+Model: model_best_ssim.pth
+Count: 200
+
+Mean MSE:  0.019043
+Real SSIM: 0.875126
+Imag SSIM: 0.881184
+Avg SSIM:  0.878155
+RRMSE:     0.137934

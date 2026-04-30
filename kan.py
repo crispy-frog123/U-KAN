@@ -1,9 +1,17 @@
+"""Core KAN layers used by the U-KAN architecture.
+
+The implementation follows spline-augmented linear projections and provides
+utility methods for adaptive grid updates and regularization.
+"""
+
 import torch
 import torch.nn.functional as F
 import math
 
 
 class KANLinear(torch.nn.Module):
+    """Spline-augmented linear layer used as the basic KAN building block."""
+
     def __init__(
         self,
         in_features,
@@ -233,6 +241,8 @@ class KANLinear(torch.nn.Module):
 
 
 class KAN(torch.nn.Module):
+    """Stacked KANLinear network with optional grid updates."""
+
     def __init__(
         self,
         layers_hidden,
