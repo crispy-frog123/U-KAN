@@ -88,6 +88,14 @@ class FcsAttention(nn.Module):
             nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
             nn.Sigmoid()
         )
+        # Disagreement map models branch uncertainty; high disagreement often causes boundary over-expansion.
+        self.disagree_gate = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 1, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+        self.disagree_suppress = nn.Parameter(torch.tensor(0.35, dtype=torch.float32))
         self.spatial = SpatialAttention()
 
         # Fixed EM priors: gradient and Laplacian emphasize scattering boundaries.
@@ -104,16 +112,39 @@ class FcsAttention(nn.Module):
         self.register_buffer('em_sobel_x', sobel_x.repeat(out_channels, 1, 1, 1), persistent=False)
         self.register_buffer('em_sobel_y', sobel_y.repeat(out_channels, 1, 1, 1), persistent=False)
         self.register_buffer('em_lap', lap.repeat(out_channels, 1, 1, 1), persistent=False)
+        self.register_buffer('hf_lap', lap.repeat(out_channels, 1, 1, 1), persistent=False)
         # Learnable multi-scale fusion weights for d=1/2/3 priors.
         self.em_scale_logits = nn.Parameter(torch.zeros(3, dtype=torch.float32))
-        # Sparse-focus gate on high-scattering regions.
-        self.focus_tau = nn.Parameter(torch.tensor(0.30, dtype=torch.float32))
-        self.focus_gamma = nn.Parameter(torch.tensor(10.0, dtype=torch.float32))
+        # Soft Top-k sparse focus (more selective by default for thinner boundary attention).
+        self.focus_quantile = 0.88
+        self.focus_temp = nn.Parameter(torch.tensor(8.0, dtype=torch.float32))
         self.em_blend = nn.Parameter(torch.tensor(0.35, dtype=torch.float32))
+        # High-frequency rescue gate to mitigate spectral-bias-induced detail loss.
+        self.hf_gain = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
+        # Background shrink avoids foreground area over-expansion.
+        self.bg_shrink = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
+        # Residual attention intensity with signed gating.
+        self.residual_eta = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
 
     @staticmethod
     def _normalize_map(v):
         return v / v.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+
+    def _branch_disagreement(self, x_left, x_right):
+        c = min(x_left.shape[1], x_right.shape[1])
+        diff = torch.abs(x_left[:, :c] - x_right[:, :c]).mean(dim=1, keepdim=True)
+        diff = self._normalize_map(diff)
+        return self.disagree_gate(diff)
+
+    def _soft_topk_focus(self, em_map):
+        b = em_map.shape[0]
+        em_f = em_map.float()
+        flat = em_f.flatten(1)
+        q = torch.quantile(flat, q=float(self.focus_quantile), dim=1, keepdim=True)
+        q = q.view(b, 1, 1, 1)
+        temp = torch.clamp(self.focus_temp, min=1.0, max=40.0).to(dtype=em_f.dtype)
+        focus = torch.sigmoid(temp * (em_f - q))
+        return focus.to(dtype=em_map.dtype)
 
     def _em_prior(self, x):
         kx = self.em_sobel_x.to(dtype=x.dtype)
@@ -131,11 +162,14 @@ class FcsAttention(nn.Module):
 
         scale_w = F.softmax(self.em_scale_logits, dim=0).to(dtype=x.dtype)
         em_multi = scale_w[0] * em_maps[0] + scale_w[1] * em_maps[1] + scale_w[2] * em_maps[2]
-
-        tau = torch.clamp(self.focus_tau, min=0.0, max=1.0).to(dtype=x.dtype)
-        gamma = torch.clamp(self.focus_gamma, min=1.0, max=30.0).to(dtype=x.dtype)
-        focus = torch.sigmoid(gamma * (em_multi - tau))
+        focus = self._soft_topk_focus(em_multi)
         return self._normalize_map(em_multi * focus)
+
+    def _hf_prior(self, x):
+        kl = self.hf_lap.to(dtype=x.dtype)
+        hf = F.conv2d(x, kl, padding=1, groups=self.out_channels).abs()
+        hf = hf.mean(dim=1, keepdim=True)
+        return self._normalize_map(hf)
 
     def forward(self, x):
         # 1) Decoupled branch gating.
@@ -146,12 +180,24 @@ class FcsAttention(nn.Module):
         x_decoupled = torch.cat([x_left, x_right], dim=1)
         x_decoupled = x_decoupled * self.cross_gate(x_decoupled)
 
-        # 2) Spatial gate + 3) EM sparse-focus prior gate.
+        # 2) Spatial gate + 3) EM sparse-focus prior gate with uncertainty suppression.
         spatial_gate = self.spatial(x_decoupled)
         em_gate = self._em_prior(x_decoupled)
+        hf_gate = self._hf_prior(x_decoupled)
+        hf_w = torch.clamp(self.hf_gain, min=0.0, max=0.8).to(dtype=x.dtype)
+        em_gate = self._normalize_map((1.0 - hf_w) * em_gate + hf_w * hf_gate)
+
+        disagree_map = self._branch_disagreement(x_left, x_right).to(dtype=x.dtype)
+        ds = torch.clamp(self.disagree_suppress, min=0.0, max=0.9).to(dtype=x.dtype)
+        em_gate = torch.clamp(em_gate * (1.0 - ds * disagree_map), min=0.0, max=1.0)
+
         alpha = torch.clamp(self.em_blend, min=0.0, max=1.0).to(dtype=x.dtype)
         gate = (1.0 - alpha) * spatial_gate + alpha * em_gate
-        return gate * x_decoupled
+        bg = torch.clamp(1.0 - em_gate, min=0.0, max=1.0)
+        bgs = torch.clamp(self.bg_shrink, min=0.0, max=0.5).to(dtype=x.dtype)
+        gate_centered = (gate - 0.5) - bgs * bg
+        eta = torch.clamp(self.residual_eta, min=0.0, max=0.8).to(dtype=x.dtype)
+        return x_decoupled * (1.0 + eta * gate_centered)
 
 
 class ChannelLinear(nn.Module):
