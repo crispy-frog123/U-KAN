@@ -6,15 +6,12 @@ PyYAML==6.0.2
 tqdm==4.67.1
 matplotlib==3.10.8
 scikit-image==0.22.0
-scikit-learn==1.4.2
 albumentations==1.3.1
 opencv-python-headless==4.10.0.84
 timm==0.9.16
 tensorboard==2.17.1
 
-# PyTorch stack (ukan310 environment)
-# If reinstalling, prefer:
+# PyTorch stack used for the baseline run.
+# Install with PyTorch's CUDA index when recreating the original environment:
 # pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 torch==2.5.1+cu121
-torchvision==0.20.1+cu121
-torchaudio==2.5.1+cu121

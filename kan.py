@@ -221,14 +221,9 @@ class KANLinear(torch.nn.Module):
         """
         Compute the regularization loss.
 
-        This is a dumb simulation of the original L1 regularization as stated in the
-        paper, since the original one requires computing absolutes and entropy from the
-        expanded (batch, in_features, out_features) intermediate tensor, which is hidden
-        behind the F.linear function if we want an memory efficient implementation.
-
-        The L1 regularization is now computed as mean absolute value of the spline
-        weights. The authors implementation also includes this term in addition to the
-        sample-based regularization.
+        This memory-efficient approximation computes L1 and entropy terms from
+        spline weights directly instead of materializing the expanded
+        ``(batch, in_features, out_features)`` activation tensor.
         """
         l1_fake = self.spline_weight.abs().mean(-1)
         regularization_loss_activation = l1_fake.sum()

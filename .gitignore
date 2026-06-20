@@ -1,0 +1,40 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Training data, generated results, and model artifacts
+inputs/
+data/
+outputs/
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.npy
+*.npz
+*.mat
+events.out.tfevents.*
+
+# Local research/export artifacts
+docs/
+*.pdf
+*.ppt
+*.pptx
+*.zip
+*.png
+*.jpg
+*.jpeg
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local agent/session files
+AGENTS.md*

@@ -1,0 +1,367 @@
+                                                                                                                                                    1
+
+
+
+
+     Two-Step Electromagnetic Inverse Scattering via
+        U-Shaped Kolmogorov-Arnold Networks
+                                                  Jingyan Zhang, Tao Shan, Member, IEEE
+
+
+
+
+   Abstract—A BP-guided two-step framework, termed PIR-                             KANs use learnable spline-based univariate functions for
+UKAN, is proposed for electromagnetic inverse scattering. Back-                  nonlinear mapping [20], and U-shaped KANs have shown
+propagation (BP) first provides a physics-guided complex con-                    compact local–global representation ability in image tasks
+trast initialization from scattered-field data, and a U-shaped
+Kolmogorov–Arnold network (U-KAN) then performs data-                            [21]–[23]. This work introduces U-KAN into a BP post-
+driven nonlinear compensation in the image domain. To adapt                      refinement pipeline rather than treating it as a generic image-
+U-KAN to inverse-scattering reconstruction, Electromagnetically                  restoration network. The main contributions are: 1) a BP-
+Driven Sparse Fusion Attention (EDSFA) and real–imaginary                        guided PIR-UKAN framework that uses BP as a physics-
+residual refinement are introduced for cross-level fusion, compo-                guided initialization and U-KAN as a data-driven nonlinear
+nent calibration, and boundary correction. Within the considered
+settings, numerical and experimental results indicate competitive                compensator; 2) task-adapted fusion and refinement modules
+reconstruction quality, noise robustness, and small-sample adapt-                for electromagnetic inverse scattering, including Electromag-
+ability with 1.001 M trainable parameters and a forward time                     netically Driven Sparse Fusion Attention (EDSFA), FFT re-
+of 14.249 ± 0.235 ms/sample.                                                     finement, real–imaginary residual calibration, and edge resid-
+  Keywords—Inverse scattering, Deep learning, Kolmogorov–                        ual refinement; and 3) validation on simulated, noisy, same-
+Arnold network                                                                   protocol unseen, composite, and Institut Fresnel data, with
+                                                                                 complexity, runtime, and empirical stability statistics reported
+                        I. I NTRODUCTION                                         for the proposed network.
+   Electromagnetic inverse scattering reconstructs the dielectric                   Accordingly, this work develops a BP-guided two-stage
+distribution of unknown scatterers from limited scattered-field                  refinement framework for electromagnetic inverse scattering.
+measurements [1], [2]. The problem is nonlinear and ill-                         The BP method first generates a physically meaningful coarse
+posed because the total field inside the domain depends on                       reconstruction from scattered-field measurements, and a U-
+the unknown contrast. Classical methods include non-iterative                    shaped Kolmogorov–Arnold network (U-KAN) then performs
+linearized schemes, such as the Born approximation and back-                     nonlinear compensation on this initialization to improve ar-
+propagation (BP) [3], [4], and iterative optimization methods,                   tifact suppression, boundary recovery, and local detail cor-
+such as the Born iterative method, contrast source inversion                     rection. The reconstruction accuracy, robustness, and gener-
+(CSI), and subspace-based optimization [5]–[7]. These meth-                      alization behavior of this framework are evaluated under the
+ods provide useful physical priors but may suffer from low                       adopted numerical and experimental settings.
+resolution, artifacts, or high computational cost under limited-
+view and noisy measurements.                                                     II. F ORMULATIONS OF I NVERSE S CATTERING P ROBLEMS
+   Deep learning has been used to improve reconstruction                            The domain of interest D is assumed to be invariant
+quality and speed in inverse scattering. Representative stud-                    along the z-axis and contains arbitrarily shaped scatterers. A
+ies include post-reconstruction refiners [8]–[10], unrolled                      total of Ns transmitting antennas and Nr receiving antennas
+or physics-assisted solvers [11]–[13], multifrequency learn-                     are uniformly distributed along an observation circle S that
+ing [14]–[16], and wavelet-based compressive deep-learning                       encloses D. Under transverse magnetic (TM) polarization, the
+schemes [17]. Recent two-step and cascaded methods, in-                          incident field E i , the total field E t within D and the scattered
+cluding PGAN [18] and ECBIC-Net [19], further show that                          field E s measured on S satisfy the following equations:
+combining a physics-related initialization with a neural refiner                                           Z
+is an effective route for inverse-scattering imaging. Different                     Emt
+                                                                                        (r) = Emi
+                                                                                                  (r) +        G(r, r′ )χ(r′ )Em
+                                                                                                                               t
+                                                                                                                                 (r′ )dr′ , r ∈ D (1)
+from wavelet-based compressive schemes, this work focuses                                                   D
+                                                                                                      Z
+on compact BP-guided nonlinear post-refinement, where U-                                  s
+                                                                                         En,m (r) =         G(r, r′ )χ(r′ )Em
+                                                                                                                            t
+                                                                                                                              (r′ )dr′ , r ∈ S   (2)
+KAN compensates nonlinear residuals, boundary blurring, and                                             D
+real–imaginary coupling errors in BP-initialized images.
+                                                                                 where G denotes the Green’s function, χ is the contrast dis-
+This work was supported in part by the National Natural Science Foundation       tribution, m = 1, · · · , Ns and n = 1, · · · , Nr . In conjunction
+of China under Grant 62401035; in part by the Fundamental Research Funds         with the method of moments (MoM), the inverse scattering
+for the Central Universities; in part by Key Laboratory of Intelligent Systems
+and Equipment Electromagnetic Environment Effect, Ministry of Industry and       problem is formulated as a minimization problem to determine
+Information Technology. (Corresponding author: Tao Shan.)                        the contrast function χ
+Jingyan Zhang and Tao Shan are with School of Electronics and Information                           X
+                                                                                                             s,mea         s,cal
+Engineering, Beihang University.                                                              min         ||En,m   (χ) − En,m    (χ)||2          (3)
+(e-mail:taoshan@buaa.edu.cn).                                                                   χ
+                                                                                                    n,m
+                                                                                                                                                                                          2
+
+
+
+
+Fig. 1. Overall framework of the proposed BP-guided two-step refinement method.
+
+
+
+where E s,mea and E s,cal denote the measured and calculated
+                                                                                           Channel Attention                         Spatial-Edge Gate                      Feature
+scattered fields.                                                                                                                                                         Reweighting
+                                                                                                     Channel Gate
+                                                                                                                           Avg Pool
+                                                                                                                        global response
+                       III. P ROPOSED M ETHOD                                                                                              ⨁ 7×7 Conv
+
+
+
+
+                                                                                                                                                               1×1 Conv
+                                                                                                                           Max Pool
+
+  The proposed method is termed Physics-Initialized Refine-                                                         ⨁   salient response                   ⨁              ⨂ ⨁
+                                                                                                                         Sobel Gradient        Laplacian
+ment U-KAN (PIR-UKAN), and its overall framework is                                                                        Operation           Operation
+                                                                                                     Channel Gate
+shown in Fig. 1. First, the measured scattered field is mapped
+by the back-propagation (BP) method to a complex-valued
+contrast initialization
+                                                                                     Fig. 3. Structure of the EDSFA module.
+                                χ0 = B(Es ),                                   (4)
+where B(·) denotes the BP reconstruction operator and Es is
+                                                                                     the coupling bias between the real and imaginary components
+the scattered field. The real and imaginary parts of χ0 are then
+                                                                                     and compensate for boundary blurring and local-detail loss in
+concatenated along the channel dimension as
+                                                                                     the BP initialization. Therefore, the proposed method follows
+                            X = [ℜ(χ0 ), ℑ(χ0 )].                              (5)   a two-step reconstruction pipeline, i.e., BP-based physical
+                                                                                     initialization followed by network-based nonlinear refinement.
+                                                                                        As shown in Fig. 2, the backbone is inspired by the
+  The input X is fed into the network backbone for image-
+                                                                                     U-shaped encoder–decoder design of U-KAN [21], [22]. It
+domain nonlinear compensation, producing a base complex-
+                                                                                     adopts a similar multiscale feature extraction and progres-
+valued prediction. Tail refinement modules further calibrate
+                                                                                     sive recovery scheme, where the encoder extracts features
+                                                                                     from the BP-initialized input, the decoder restores spatial
+                                                                                     structures, and skip connections preserve shallow details.KAN
+                                                                    Output           units are used to enhance compact nonlinear representa-
+                                                                                     tion, while electromagnetic-driven sparse focusing attention
+  Input                          EDSFA                     EDSFA                     (EDSFA) modules are inserted at cross-level fusion positions
+ N×N×2
+                                                                                     to further emphasize boundary and local-detail information.
+          N×N×16                                  N×N×16           N×N×2
+                                                                                        The EDSFA module, shown in Fig. 3, is used to reweight
+                                 EDSFA            EDSFA
+                                                                                     skip and multiscale fusion features in a boundary-aware man-
+                                                                   Layer Norm
+                                                                   Tokenization
+                                                                                     ner. Given a fused feature F , EDSFA first splits the channels
+                   N×N×32                N×N×32
+                                                                   KAN Layer         into two branches and applies branch-wise channel gates to
+                                                                   DwConv            balance the contributions of upsampled semantic features and
+                                                                                     shallow detail features. A spatial attention map is generated by
+                              N×N×128
+                                                                                     average pooling, maximum pooling, and a 7 × 7 convolution,
+Fig. 2. Structure of the U-KAN backbone used in the proposed method.                                 As = σ (f7×7 ([Avg(F ), Max(F )])) ,                                               (6)
+                                                                                                                                                      3
+
+
+
+where σ(·) denotes the sigmoid function. Meanwhile, fixed So-                                 IV. N UMERICAL R ESULTS
+bel and Laplacian operators are used to extract edge-gradient                The simulated domain is 0.15 m × 0.15 m and discretized
+and high-frequency responses, forming an electromagnetic                  into 64×64 grids. Thirty-two transmitters are uniformly placed
+boundary prior                                                            on a circle of radius 1.67 m, and the operating frequency is 3
+                                                                          GHz. MNIST-shaped scatterers are used [24]. The main dataset
+                    Pem = Φ (S(F ), L(F )) ,                        (7)   contains 2,000 samples, split into 1,600/200/200 for training,
+                                                                          validation, and in-distribution testing. An additional 18,000
+where S(·) and L(·) denote Sobel and Laplacian operations,
+                                                                          unseen samples are generated using the same simulation
+respectively, and Φ(·) represents normalization and sparse
+                                                                          protocol as the training data, with random scatterer shapes
+focusing. The spatial attention, electromagnetic prior, and
+                                                                          and the same dielectric-constant range, but are never used
+branch-disagreement suppression are fused into a gate A,
+                                                                          during model training. Composite digits are used for structural
+which is applied to the input feature through residual scaling:
+                                                                          extrapolation, and Institut Fresnel data are used for transfer-
+                      Fout = F ⊙ (1 + ηA).                          (8)   adapted experimental validation.
+                                                                             PIR-UKAN is trained on a single NVIDIA RTX 4090 GPU
+In this way, EDSFA enhances reliable boundaries and lo-                   using Adam [25] with an initial learning rate of 1 × 10−3
+cal details while suppressing background responses without                and a cosine annealing schedule; the batch size is 8. Mean
+changing the feature size.                                                Squared Error (MSE) and Structural Similarity Index Measure
+   We further cascade a dual-channel tail refinement module               (SSIM) [26] are used to evaluate the reconstructions.
+at the end of the network, as shown on the right side of
+                                                                                                       TABLE I
+Fig. 1. The backbone first outputs the full-resolution feature                     Q UANTITATIVE C OMPARISON AND PARAMETER S CALE
+Fb , which is passed through a lightweight FFT-based Fourier
+refine module for frequency-domain compensation, producing                 Method            Train.  Params   SSIM↑ MSE↓              RRMSE↓
+the base prediction Yf = [Yfr , Yfi ]. Then, Dual R/I refine               BP [9]               –        0     0.069 0.3364              –
+                                                                           CSI [9]              –        0     0.861 0.0826              –
+constructs two independent lightweight residual branches for               DeepNIS [9]       7,000    N.S.a    0.829 0.0908              –
+the real and imaginary components, respectively. Each branch               PGAN [18]          5,000 ≈31.04 Mb 0.880     –              0.120
+consists of two 3×3 convolutional blocks and a 1×1 projection              ECBIC-Net [19]    10,000   5.6 M    0.905    –                –
+layer. It combines the shared feature, the corresponding BP-               PIR-UKAN          1,600   1.001 M   0.880 0.0183            0.135
+                                                                           a Not specified in the published architecture. b Estimated from the PGAN
+input component, and the current prediction component to
+                                                                           generator used at inference.
+generate the residual correction:
+                                                                             Table I presents a quantitative comparison between PIR-
+        YRI = Yf + [gr (Fb , X r , Yfr ), gi (Fb , X i , Yfi )],    (9)
+                                                                          UKAN and several representative methods. The baseline re-
+where gr (·) and gi (·) denote the real- and imaginary-                   sults are taken from the corresponding publications, where BP,
+part refinement branches, respectively. This design enables               CSI, and DeepNIS are quoted from the DeepNIS paper, and
+component-wise correction with limited computational over-                PGAN and ECBIC-Net are quoted from their original settings.
+head.                                                                        In this comparison, PIR-UKAN achieves an SSIM of 0.880
+                                                                          and an MSE of 0.0183 using only 1,600 training samples,
+   Edge refine further introduces boundary-aware residual
+                                                                          showing competitive reconstruction quality under an extremely
+compensation. Specifically, the Sobel gradient G = S(X) is
+                                                                          small-sample setting. Meanwhile, PIR-UKAN contains only
+extracted from the BP-initialized input, and the original input
+                                                                          1.001 M trainable parameters, which is clearly smaller than the
+X, gradient map G, and previous refined prediction YRI are
+                                                                          estimated inference-side model scales of PGAN and ECBIC-
+concatenated as the input of the edge-correction branch. This
+                                                                          Net. This indicates that the proposed method can maintain
+branch first extracts edge-aware features using two 3 × 3 con-
+                                                                          favorable reconstruction performance with a lightweight model
+volutional blocks and then uses 1 × 1 convolutional branches
+                                                                          size and a smaller amount of training data.
+to predict the residual terms and gating weights for the real
+                                                                             After the evaluation on the main test split, PIR-UKAN is
+and imaginary components, respectively:
+                                                                          further assessed on the large-scale unseen set with 18,000
+                    ∆Yedge = h([X, G, YRI ]).                      (10)   samples.As shown in Fig. 4, the performance of PIR-UKAN
+                                                                          on the unseen set is close to that on the original test split.
+The final prediction is obtained as                                       The mean SSIM on the unseen set is 0.8784, close to 0.8802
+                                                                          on the original test set, and the MSE distributions show a
+                       Y = YRI + ∆Yedge ,                          (11)   similar trend. These results indicate that PIR-UKAN is not
+                                                                          only effective on the limited test split, but also maintains stable
+where Y = [ℜ(χ̂), ℑ(χ̂)]. Therefore, the tail refinement                  reconstruction performance on a larger same-protocol unseen
+module successively performs frequency-domain compensa-                   set.
+tion, real-imaginary component correction, and boundary-                     To evaluate the robustness of PIR-UKAN against input
+aware residual compensation to mitigate spectral distortion,              perturbations, additive white Gaussian noise with different
+component bias, and boundary smoothing in BP-guided re-                   signal-to-noise ratios (SNRs) is added to the input data, and the
+construction.                                                             reconstruction performance is compared under different noise
+                                                                                                                                                             4
+
+
+
+                                                         (a)                                                           (b)                             (c)
+
+
+
+
+                                                                                                                                                       (d)
+
+
+
+
+Fig. 4. Evaluation on the original test set and the same-protocol unseen dataset. (a) Samples from the original test split (N = 200). (b) Samples from the
+additional unseen set (N = 18, 000). (c) SSIM and MSE distributions on training and in-distribution test sets. (d) Corresponding distributions on the unseen
+set.
+
+
+                                                                               and FoamDielExt measurement cases. As shown in Fig. 7, the
+                                                                               fine-tuned PIR-UKAN recovers the main geometrical trends
+                                                                               and contrast distributions that are consistent with the reference
+                                                                               profiles, indicating that the proposed method can adapt to
+                                                                               measured data with measurement errors and experimental-
+                                                                               domain differences after fine-tuning with a small number of
+                                                                               measured samples.
+                                                                                  Beyond reconstruction performance, we further examine the
+                                                                               lightweight behavior, runtime at both the training and testing
+                                                                               stages, and prediction stability of PIR-UKAN, as summarized
+                                                                               in Table II. The network contains 1.001 M trainable parameters
+                                                                               and 1.325 G FLOPs, with a total training time of 1.47 h
+                                                                               and a forward inference time of 14.249 ± 0.235 ms/sample.
+                                                                               When the SNR decreases from 20 dB to 10 dB, the global
+                                                                               empirical uncertainty increases from 0.044 to 0.116, while
+Fig. 5. Qualitative evaluation of noise robustness under varying SNRs (Clean   pixel-wise uncertainty remains positively correlated with the
+to 10 dB). Rows 1 and 3 show the real and imaginary parts of the noisy         reconstruction error.
+scattered fields. Rows 2 and 4 show the corresponding reconstructed complex
+permittivity. Structural integrity is maintained even at 10 dB SNR.
+                                                                                                     V. C ONCLUSION
+                                                                                  This letter presented PIR-UKAN, a BP-guided U-KAN
+levels. As shown in Fig. 5, as the SNR decreases, background                   refinement framework for electromagnetic inverse scattering.
+artifacts and local contrast deviations become more evident,                   BP provides a physics-guided initialization, and U-KAN per-
+and the quantitative metrics also degrade accordingly. The                     forms compact data-driven nonlinear compensation through
+average SSIM decreases from 0.880 in the clean case to 0.631                   EDSFA, real–imaginary calibration, and edge residual re-
+at 10 dB. Although strong noise reduces the reconstruction                     finement. Within the considered simulated and experimental
+accuracy, PIR-UKAN still preserves the main geometrical
+outlines under the considered noisy conditions, indicating that
+BP initialization and subsequent nonlinear refinement provide
+a certain degree of robustness to noise perturbations.
+   To further evaluate the adaptability of PIR-UKAN to unseen
+structural combinations, zero-shot testing is performed on
+composite MNIST digits without additional fine-tuning. As
+shown in Fig. 6, PIR-UKAN can recover the main structural
+outlines in several composite-digit samples, indicating that the
+learned BP-refinement mapping still has a certain degree of
+adaptability to some unseen combined structures.
+   To evaluate the adaptability of PIR-UKAN to measured
+data, the model is further tested on the Institut Fresnel mea-                 Fig. 6. Evaluation of structural extrapolation. Zero-shot reconstruction results
+surement data. It is first fine-tuned for 80 epochs using 160                  on the out-of-distribution (OOD) composite MNIST dataset. GT and Pred de-
+cylindrical-target samples and then applied to the FoamDielInt                 note the ground truth and predicted complex permittivity profiles, respectively.
+                                                                                                                                                              5
+
+
+
+                                                                                  [12] Y. Liu, H. Zhao, R. Song, X. Chen, C. Li, and X. Chen, “SOM-
+                                                                                       Net: Unrolling the Subspace-Based Optimization for Solving Full-Wave
+                                                                                       Inverse Scattering Problems,” IEEE Transactions on Geoscience and
+                                                                                       Remote Sensing, vol. 60, pp. 1–15, 2022.
+                                                                                  [13] J. Liu, H. Zhou, T. Ouyang, Q. Liu, and Y. Wang, “Physical Model-
+                                                                                       Inspired Deep Unrolling Network for Solving Nonlinear Inverse Scat-
+                                                                                       tering Problems,” IEEE Transactions on Antennas and Propagation,
+                                                                                       vol. 70, no. 2, pp. 1236–1249, 2022.
+                                                                                  [14] M. Salucci, L. Poli, N. Anselmi, and A. Massa, “Multifrequency particle
+Fig. 7. Evaluation of domain adaptation. Reconstruction results on the                 swarm optimization for enhanced multiresolution GPR microwave imag-
+experimental cylinder dataset after transfer adaptation with only 160 measured         ing,” IEEE Transactions on Geoscience and Remote Sensing, vol. 55,
+samples. GT and Pred denote the ground truth and predicted complex                     no. 3, pp. 1305–1317, 2016.
+permittivity profiles, respectively.                                              [15] Z. Lin, R. Guo, M. Li, A. Abubakar, T. Zhao, F. Yang, and S. Xu, “Low-
+                                                                                       frequency data prediction with iterative learning for highly nonlinear
+                                                                                       inverse scattering problems,” IEEE Transactions on Microwave Theory
+                            TABLE II
+                                                                                       and Techniques, vol. 69, no. 10, pp. 4366–4376, 2021.
+     M ODEL COMPLEXITY, RUNTIME , AND EMPIRICAL UNCERTAINTY
+                                                                                  [16] D. Liu, T. Shan, M. Li, F. Yang, and S. Xu, “Multi-frequency neural
+                    STATISTICS OF PIR-UKAN
+                                                                                       born iterative method for solving 2-d inverse scattering problems,” IEEE
+                                                                                       Transactions on Computational Imaging, 2025.
+             Metric                                Value                          [17] Z. Zong, Y. Wang, and Z. Wei, “A wavelet-based compressive deep
+             Trainable Parameters                 1.001 M                              learning scheme for inverse scattering problems,” IEEE Transactions on
+             Model Size                          3.888 MB                              Geoscience and Remote Sensing, vol. 60, p. 2007511, 2022.
+             FLOPs                                1.325 G                         [18] R. Song, Y. Huang, K. Xu, X. Ye, C. Li, and X. Chen, “Electromagnetic
+             Total Training Time                   1.47 h                              inverse scattering with perceptual generative adversarial networks,”
+             Forward Time / sample           14.249 ± 0.235 ms                         IEEE Transactions on Computational Imaging, vol. 7, pp. 689–699,
+             Global Uncertainty (20 dB)            0.044                               2021.
+             Global Uncertainty (10 dB)            0.116                          [19] J. Wang, Z. Li, H. Xu, and N. Hu, “Enhanced contrast born iterative
+             Corr(std,error) at 20 dB              0.691                               cascaded network for high-contrast inverse scattering imaging,” IEEE
+             Corr(std,error) at 10 dB              0.729                               Antennas and Wireless Propagation Letters, vol. 24, no. 10, pp. 3440–
+                                                                                       3444, 2025.
+                                                                                  [20] Z. Liu, Y. Wang, S. Vaidya, F. Ruehle, J. Halverson, M. Soljacić,
+                                                                                       T. Y. Hou, and M. Tegmark, “Kan: Kolmogorov-arnold networks,” arXiv
+settings, the results indicate competitive reconstruction quality                      preprint arXiv:2404.19756, 2024.
+with limited training samples and modest model complex-                           [21] C. Li, X. Liu, W. Li, C. Wang, H. Liu, Y. Liu, Z. Chen, and Y. Yuan,
+ity. The current framework remains an image-domain refiner                             “U-kan makes strong backbone for medical image segmentation and
+                                                                                       generation,” in Proceedings of the AAAI Conference on Artificial Intel-
+whose performance depends on the BP initialization and                                 ligence, vol. 39, 2025.
+training distribution; tighter full-wave physics integration and                  [22] B. Zhang, H. Huang, Y. Shen, and M. Sun, “Mm-ukan++: A novel
+rigorous probabilistic uncertainty modeling will be considered                         kolmogorov-arnold network-based u-shaped network for ultrasound im-
+                                                                                       age segmentation,” IEEE Transactions on Ultrasonics, Ferroelectrics,
+in future work.                                                                        and Frequency Control, vol. 72, no. 4, 2025.
+                                                                                  [23] X. Cheng et al., “Implicit u-kan2.0: Dynamic, efficient and interpretable
+                              R EFERENCES                                              medical image segmentation,” arXiv preprint arXiv:2503.03141, 2025.
+                                                                                  [24] Y. LeCun, L. Bottou, Y. Bengio, and P. Haffner, “Gradient-based learning
+ [1] X. Chen, Computational methods for electromagnetic inverse scattering.            applied to document recognition,” Proceedings of the IEEE, vol. 86,
+     John Wiley & Sons, 2018.                                                          no. 11, pp. 2278–2324, 1998.
+ [2] M. Pastorino, Microwave imaging. John Wiley & Sons, 2010.                    [25] D. P. Kingma and J. Ba, “Adam: A method for stochastic optimization,”
+ [3] M. Slaney, A. C. Kak, and L. E. Larsen, “Limitations of imaging with              arXiv preprint arXiv:1412.6980, 2014.
+     first-order diffraction tomography,” IEEE transactions on microwave          [26] Z. Wang, A. C. Bovik, H. R. Sheikh, and E. P. Simoncelli, “Image
+     theory and techniques, vol. 32, no. 8, pp. 860–874, 1984.                         quality assessment: from error visibility to structural similarity,” IEEE
+ [4] K. Belkebir, P. C. Chaumet, and A. Sentenac, “Superresolution in                  transactions on image processing, vol. 13, no. 4, pp. 600–612, 2004.
+     total internal reflection tomography,” Journal of the Optical Society of
+     America A, vol. 22, no. 9, pp. 1889–1897, 2005.
+ [5] W. C. Chew and Y.-M. Wang, “Reconstruction of two-dimensional
+     permittivity distribution using the distorted Born iterative method,” IEEE
+     transactions on medical imaging, vol. 9, no. 2, pp. 218–225, 1990.
+ [6] P. M. Van den Berg and A. Abubakar, “Contrast source inversion
+     method: State of art,” Progress in Electromagnetics research, vol. 34,
+     no. 11, pp. 189–218, 2001.
+ [7] X. Chen, “Subspace-based optimization method for solving inverse-
+     scattering problems,” IEEE Transactions on Geoscience and Remote
+     Sensing, vol. 48, no. 1, pp. 42–49, 2009.
+ [8] Z. Wei and X. Chen, “Deep-learning schemes for full-wave nonlinear
+     inverse scattering problems,” IEEE Transactions on Geoscience and
+     Remote Sensing, vol. 57, no. 4, pp. 1849–1860, 2018.
+ [9] L. Li, L. G. Wang, F. L. Teixeira, C. Liu, A. Nehorai, and T. J. Cui,
+     “Deepnis: Deep neural network for nonlinear electromagnetic inverse
+     scattering,” IEEE Transactions on Antennas and Propagation, vol. 67,
+     no. 3, pp. 1819–1825, 2019.
+[10] K. Xu, L. Wu, X. Ye, and X. Chen, “Deep learning-based inversion
+     methods for solving inverse scattering problems with phaseless data,”
+     IEEE Transactions on Antennas and Propagation, vol. 68, no. 11, pp.
+     7457–7470, 2020.
+[11] T. Shan, Z. Lin, X. Song, M. Li, F. Yang, and S. Xu, “Neural born
+     iterative method for solving inverse scattering problems: 2D cases,”
+     IEEE Transactions on Antennas and Propagation, vol. 71, no. 1, pp.
+     818–829, 2022.
+

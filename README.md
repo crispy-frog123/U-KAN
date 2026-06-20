@@ -1,88 +1,98 @@
-# U-KAN for Two-Step Electromagnetic Inverse Scattering Imaging
+# PIR-UKAN for Electromagnetic Inverse Scattering
 
-This repository contains the training and evaluation code for a U-KAN-based pipeline for complex-valued electromagnetic inverse scattering imaging (real/imaginary channels).
+This repository implements Physics-Initialized Refinement U-KAN (PIR-UKAN), a
+BP-guided two-step framework for complex-valued electromagnetic inverse
+scattering. Back-propagation (BP) first produces a physics-guided complex
+contrast initialization from scattered-field measurements. A U-shaped
+Kolmogorov-Arnold Network (U-KAN) then performs image-domain nonlinear
+compensation to suppress artifacts, recover boundaries, and correct local
+details.
 
-## Features
-
-- U-KAN backbone with KAN blocks (`archs.py`, `kan.py`)
-- Frequency-channel-spatial attention module (`FCS_attention.py`)
-- Complex-valued dataset loader from `.mat` files (`dataset_e.py`)
-- Training script with optional refinement modules (`train.py`)
-- evaluation scripts（`test_norm.py`）
+PIR-UKAN adapts U-KAN to inverse-scattering reconstruction with
+Electromagnetically Driven Sparse Fusion Attention (EDSFA), FFT refinement,
+real-imaginary residual calibration, and edge-aware residual refinement. Inputs
+and targets are represented as real/imaginary channels.
 
 ## Repository Structure
 
 ```text
 .
-|-- archs.py
-|-- kan.py
-|-- FCS_attention.py
-|-- dataset_e.py
-|-- utils.py
-|-- train.py
-|-- test_norm.py
-|-- inputs/
-|   |-- input/
-|   `-- label/
+|-- config.py       # single source of baseline defaults
+|-- archs.py        # U-KAN backbone, FCSA blocks, refinement heads
+|-- kan.py          # spline-augmented KAN layers
+|-- dataset.py      # complex-valued MAT dataset loader
+|-- utils.py        # meters, SSIM loss, relative-error helper
+|-- train.py        # baseline training entrypoint
+|-- test.py         # baseline evaluation entrypoint
+|-- requirements.txt
+`-- LICENSE
 ```
 
-## Enviro
+## Environment
 
-- Python 3.10 (recommended)
-- PyTorch with CUDA support
-
-Install dependencies:
+Python 3.10 is recommended. Install dependencies with:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Dataset Preparation
+The baseline was trained with PyTorch 2.5.1 + CUDA 12.1. If your package index
+does not resolve the CUDA wheels from `requirements.txt`, install PyTorch first
+from the official CUDA index shown in the comments inside `requirements.txt`.
 
-The default training script expects:
+## Data Layout
 
-- `inputs/input/chi0_all_real_mnist.mat`
-- `inputs/input/chi0_all_imag_mnist.mat`
-- `inputs/label/chi_all_real_mnist.mat`
-- `inputs/label/chi_all_imag_mnist.mat`
+The default baseline configuration expects:
 
-If you use different files, pass custom paths via command-line arguments.
+```text
+inputs/
+|-- input/
+|   |-- chi0_all_real_mnist.mat
+|   `-- chi0_all_imag_mnist.mat
+`-- label/
+    |-- chi_all_real_mnist.mat
+    `-- chi_all_imag_mnist.mat
+```
 
 ## Training
 
-Baseline example:
+The default command is intentionally enough: all defaults come from
+`config.py` and mirror `outputs/baseline/config.yml`.
 
 ```bash
-python train.py --name baseline_run --epochs 400 -b 8 --arch UKAN --deep_supervision True --loss MSE_SSIM --data_dir inputs --real_img_file input/chi0_all_real_mnist.mat --imag_img_file input/chi0_all_imag_mnist.mat --real_label_file label/chi_all_real_mnist.mat --imag_label_file label/chi_all_imag_mnist.mat --input_h 64 --input_w 64 --original_img_size 64 --input_channels 2 --num_classes 2 --input_list 128,160,256 --optimizer Adam --lr 0.0001 --kan_lr 0.001 --weight_decay 0.0001 --kan_weight_decay 0.0001 --scheduler CosineAnnealingLR --min_lr 1e-6 --dataseed 2981 --num_workers 0
+python train.py
 ```
 
-Training outputs are written to:
+Useful overrides are still available, for example:
 
-- `outputs/<experiment_name>/`
+```bash
+python train.py --name my_baseline_run --epochs 400 --batch_size 8
+```
 
-Typical files include:
-
-- `config.yml`
-- `log.csv`
-- `model.pth`
-- `model_best_mse.pth`
-- `model_best_ssim.pth` (if enabled by metric logic)
-- `norm_stats.json`
+Each run writes `config.yml`, `norm_stats.json`, `split_indices.json`,
+checkpoints, metrics, TensorBoard logs, and a minimal `code_backup/` snapshot
+under `outputs/<name>/`.
 
 ## Evaluation
 
-Evaluate on configurable split/group:
+Evaluate the packaged baseline checkpoint directory:
 
 ```bash
-python test_norm.py --exp_dir outputs/baseline_run --checkpoint model_best_mse.pth
+python test.py --exp_dir outputs/baseline --checkpoint model_best_ssim.pth
 ```
 
+By default, evaluation uses the same 10% shuffled test split and train-set
+normalization statistics as the baseline run.
 
-## Notes
+## Baseline Reference
 
-- This code assumes CUDA is available for training.
-- Large datasets are not included by default.
-- Open-source model weights are located in /checkpoints.
+The saved baseline run reports:
+
+- Best validation MSE: `0.02010381`
+- Best validation SSIM: `0.90062162`
+- Test mean MSE: `0.018322`
+- Test average SSIM: `0.880230`
+- Test RRMSE: `0.135269`
 
 ## License
 
